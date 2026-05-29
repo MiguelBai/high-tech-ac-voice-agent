@@ -1,5 +1,25 @@
+# Secrets — NEVER commit
 .env
+
+# Python
 __pycache__/
 *.pyc
 
+# Git worktrees
 .worktrees/
+
+# The deploy/ separate git repo is NOT tracked here (it's its own repo linked to Railway).
+# A read-only snapshot of the live code lives in live-production/ — see its README.
+deploy/
+
+# Local runtime state (SQLite, persisted json) — not source
+data/
+
+# Heavy client deliverables / research scrapes (kept out of the shared repo on purpose)
+*.pdf
+.firecrawl/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+settings.json

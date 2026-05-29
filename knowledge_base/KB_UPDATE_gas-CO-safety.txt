@@ -1,0 +1,55 @@
+# ============================================================
+# PROPOSED KNOWLEDGE-BASE UPDATE — GAS / CO LIFE-SAFETY
+# ============================================================
+# This is NOT the live knowledge base. It is a review copy of the ONLY
+# section that needs to change. Reason: the current "EMERGENCY CALLS"
+# section tells Sarah to pitch the $120 visit for a gas smell / carbon
+# monoxide alarm. That contradicts the new life-safety rule now in the
+# agent prompt (§6), which tells the caller to leave and call 911 / the
+# gas company FIRST. The knowledge base must agree with the prompt so RAG
+# retrieval doesn't pull conflicting guidance.
+#
+# HOW TO MERGE: in High_Tech_AC_Knowledge_Base.txt, replace the existing
+# "## EMERGENCY CALLS" section with the block below, and add the new gas/CO
+# FAQ entry to the FAQ section. Then re-upload the file to the Retell
+# knowledge base (knowledge_base_983039ddc5d9b24b).
+# ============================================================
+
+
+## EMERGENCY CALLS
+
+### LIFE-SAFETY HAZARDS — handle BEFORE anything else
+If the caller reports a GAS SMELL, a CARBON MONOXIDE alarm, or smoke / a
+burning smell, this is NOT a normal service call. Do NOT quote a fee or
+offer to dispatch a tech. Tell them: "Please leave the building now and call
+911 or your gas company right away." Only after they confirm they are safe
+may you offer to schedule a follow-up visit.
+
+### What Counts as an (After-Hours) Emergency
+Any of the following qualify for the $120 emergency response:
+- Call placed AFTER 5:00 PM Monday through Friday
+- Call placed AFTER 2:00 PM on Saturday
+- Call placed ANY TIME on Sunday
+- During regular hours: no AC at all, no heat at all, water leak from the
+  system, flooding, or a burst pipe
+
+### Emergency Protocol (after-hours / no-cooling / no-heat / water)
+1. Acknowledge the urgency: "It sounds like this could be an emergency."
+2. Inform: "There is a $120 emergency service fee to send a technician out right now."
+3. If the customer AGREES to the $120 fee: collect their name, the issue,
+   address, phone number, and email. Then transfer the call to the on-call technician.
+4. If the customer DECLINES the $120 fee: offer to schedule the next available
+   regular appointment instead.
+
+### Emergency On-Call Technician
+Name: Keivin Rivero
+Phone: (786) 532-8419
+(Note: the on-call tech may rotate based on the team schedule. The dashboard tracks who is on-call each week.)
+
+
+# ---- ADD THIS to the FREQUENTLY ASKED QUESTIONS section ----
+
+### Q: I smell gas / my carbon monoxide alarm is going off
+A: That's a safety emergency, not something to wait on. Please leave the building
+now and call 911 or your gas company right away. Once you're safe, we'd be glad to
+schedule a technician to come check the system.
