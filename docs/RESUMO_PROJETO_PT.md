@@ -72,11 +72,11 @@ A Sarah v2 é um agente de **prompt único** (*single-prompt*). Ou seja: **todo 
 - **ID do LLM (Retell):** `llm_3f1ab929b9b566f0a1a4be12ecfb` — é aqui que o prompt (`general_prompt`) vive.
 - **Cópia local do prompt:** `retell/planning/retell_agent_prompt_v2.md` — sempre mantemos esse arquivo igual ao que está publicado na Retell, pra não "dessincronizar".
 
-### Por que "v2"? (decisão importante)
+### Por que "v2"? (decisão de arquitetura)
 
-A **primeira versão era um "conversation flow"** — um fluxo em forma de grafo/diagrama, com nós e ramificações ("se o cliente disser X, vá para o nó Y"). **Esse modelo não funcionou bem:** era frágil, difícil de ajustar e quebrava em conversas fora do roteiro.
+A primeira versão era um **"conversation flow"** — um fluxo em forma de grafo/diagrama, com nós e ramificações ("se o cliente disser X, vá para o nó Y"). Esse modelo era frágil e difícil de ajustar quando a conversa saía do roteiro. Por isso migramos para um **agente de prompt único**, que é muito mais flexível e fácil de iterar.
 
-Trocamos tudo por um **agente de prompt único**, que é muito mais flexível e fácil de iterar. **Daqui pra frente, "o agente" sempre significa a Sarah v2 / prompt único.** Não mexer nem ressuscitar o fluxo antigo.
+➡️ **Daqui pra frente, "o agente" sempre significa a Sarah v2 / prompt único.** O fluxo antigo não é mais usado.
 
 ### Como o prompt está organizado
 
@@ -90,27 +90,15 @@ Este é o ponto-chave do dia a dia. **Editamos o agente direto pela API da Retel
 
 Fluxo típico de trabalho:
 
-1. O Miguel **faz uma ligação de teste** real para a Sarah e percebe um problema ("ela disse algo errado", "ela não devia fazer X", "ela alucinou um endereço").
-2. Descreve o problema aqui no Claude Code.
+1. O Miguel **faz uma ligação de teste** real para a Sarah e percebe algo a melhorar ("ela disse isso", "ela devia fazer aquilo").
+2. Descreve aqui no Claude Code.
 3. O Claude Code **edita o prompt (ou o código do servidor)** e **publica na Retell via API**.
 4. Atualiza a cópia local (`retell_agent_prompt_v2.md`) pra não dessincronizar.
 5. Nova ligação de teste pra confirmar.
 
-### Detalhe técnico do fluxo de edição do prompt na Retell
+### Como o prompt é publicado na Retell (resumo)
 
-O agente está **publicado** (em produção), e a Retell **não deixa editar uma versão publicada diretamente** (dá erro HTTP 400 "Cannot update published LLM"). Então o processo é **criar rascunho → editar → publicar**:
-
-1. `POST create-agent-version/{agent_id}` → cria um **rascunho** novo (não afeta o tráfego ao vivo).
-2. `GET get-retell-llm/{llm_id}` → pega o prompt atual do rascunho.
-3. `PATCH update-retell-llm/{llm_id}` → edita o prompt no rascunho.
-4. `POST publish-agent/{agent_id}` → publica e vira o que está ao vivo.
-5. Espelha a mudança no arquivo local.
-
-**Cuidados (já nos morderam):**
-- A versão do agente e a versão do LLM são **acopladas 1:1** (agente vN ↔ LLM vN).
-- Os comandos `get-*` retornam a **última** versão (que pode ser um rascunho novo), **não necessariamente a que está ao vivo**. Sempre **verificar qual está publicada** (`get-agent-versions`, campo `is_published`) — não confiar no número que você passou.
-- Usar **`curl`, não Python urllib** (a urllib dá erro de certificado `CERTIFICATE_VERIFY_FAILED` nesta máquina).
-- O prompt fica no **LLM** (`update-retell-llm`); já os campos de análise e a configuração de voz ficam no **agente** (`update-agent`).
+O agente está **publicado** (em produção) e a Retell não deixa editar uma versão publicada diretamente. Então o processo é **criar rascunho → editar → publicar**: cria-se uma versão nova de rascunho (sem afetar o que está ao vivo), edita-se o prompt, e só então publica. O prompt fica no **LLM**; já os campos de análise e a voz ficam no **agente**. (Os detalhes completos do passo-a-passo e dos cuidados estão no `CLAUDE.md`, seção "Editing the voice agent".)
 
 > A chave `RETELL_API_KEY` fica no arquivo `.env` (na raiz do projeto). **Nunca** subir esse arquivo pro Git.
 
@@ -120,13 +108,14 @@ O agente está **publicado** (em produção), e a Retell **não deixa editar uma
 
 ### 5.1. Retell (a voz)
 - Hospeda a Sarah. Quando alguém liga, a Retell roda o LLM e, conforme a conversa, **chama nosso backend** de duas formas:
-  - **Webhooks de ciclo de vida** → `/webhook/retell` (eventos `call_started`, `call_ended`, `call_analyzed`) e `/retell/inbound` (no início da ligação, devolvemos "variáveis dinâmicas" — ver dedupe abaixo).
+  - **Webhooks de ciclo de vida** → `/webhook/retell` (eventos `call_started`, `call_ended`, `call_analyzed`) e `/retell/inbound` (no início da ligação, devolvemos "variáveis dinâmicas" — ver "cliente recorrente" abaixo).
   - **Tools (ferramentas customizadas)** → `/check-availability`, `/create-appointment`, `/transfer-emergency`.
 - As definições das tools estão em `retell/planning/retell_tool_definitions.json`. **A Retell ignora esse arquivo em tempo de execução** — ele é só uma "fonte de cópia" pra colar no painel/usar de referência.
-- **Verificação de assinatura:** todos os 5 endpoints que a Retell chama verificam o cabeçalho `X-Retell-Signature` (HMAC com a `RETELL_API_KEY`), pra impedir que alguém de fora forje agendamentos. Hoje está em modo **`monitor`** (só registra, não bloqueia). Falta virar pra **`enforce`** depois de confirmar nos logs que todos os 5 endpoints estão assinando corretamente.
+- **Segurança:** todos os endpoints que a Retell chama verificam uma assinatura (`X-Retell-Signature`, HMAC com a `RETELL_API_KEY`), pra impedir que alguém de fora forje agendamentos.
 
 ### 5.2. Housecall Pro (a agenda)
 - É onde os agendamentos reais entram. O backend conversa com a API da HCP usando a `HCP_API_KEY`.
+- **Cliente recorrente (dedupe):** no início da ligação, o backend **procura o cliente pelo número de telefone** na HCP e reaproveita o cadastro existente — em vez de criar um cliente novo a cada ligação. A Sarah confirma a identidade e o número da casa (dígito por dígito, sem ler a rua inteira em voz alta) e só pede e-mail se faltar.
 - **Regras de agendamento (fixas no código):**
   - Fuso de Orlando: `America/New_York`. A HCP devolve em UTC; convertemos tudo pro horário local.
   - Horário de atendimento: **6h–22h, todos os dias**, janelas de chegada de **2 horas**, busca de até **7 dias** à frente.
@@ -138,14 +127,14 @@ O agente está **publicado** (em produção), e a Retell **não deixa editar uma
 
 ### 5.3. Railway (a hospedagem)
 - O `server.py` roda na Railway, no serviço **`HVAC Retell Alfredo`**.
-- **Roda em 1 único processo / 1 único worker, de propósito.** O estado das ligações ao vivo fica na memória do processo. **Não aumentar o número de workers** — isso quebraria o painel ao vivo (SSE) e o registro compartilhado de ligações.
-- Como fazer deploy está na seção 7 (tem uma pegadinha importante).
+- **Roda em 1 único processo / 1 único worker, de propósito.** O estado das ligações ao vivo fica na memória do processo. (Não é uma limitação — é uma decisão de arquitetura pra que o painel ao vivo funcione.)
+- **Como fazer deploy:** editamos o `server.py` da raiz (a fonte da verdade), copiamos pra pasta `deploy/` e rodamos `railway up`. Os comandos exatos estão no `CLAUDE.md`, seção "Deploy model".
 
 ### 5.4. Dashboard (o painel)
 - É uma página web servida pelo próprio backend. Acessa em `/dashboard?key=<senha>` (senha = `DASHBOARD_PASSWORD`).
 - Mostra **ligações ao vivo** com transcrição em tempo real (o servidor consulta a Retell a cada ~1,5s e transmite pro navegador via **SSE** — *Server-Sent Events*).
 - Tem **Central de Mensagens** (espelha os alertas), **análises** (`/analytics`) e uma aba de **on-call** (escala de plantão).
-- Visual: tema escuro/ciano, com abas inferiores no celular (Calls / Insights / On-Call / Messages). Cores têm significado: **verde = ao vivo/ativo**, **vermelho `#C4080C` = identidade da marca** (logo, botão principal). Não misturar os dois.
+- Visual: tema escuro/ciano, com abas inferiores no celular (Calls / Insights / On-Call / Messages). Cores têm significado: **verde = ao vivo/ativo**, **vermelho `#C4080C` = identidade da marca** (logo, botão principal).
 
 ### 5.5. Telegram (os alertas)
 - Bot **@hightechac_alerts_bot**, manda mensagem pro chat do Miguel (chat id `6227760301`).
@@ -158,80 +147,26 @@ Existe **uma única função** (`notify_event`) que dispara o mesmo alerta para 
 2. **Central de Mensagens** do dashboard (salva em `messages.json` + transmite ao vivo)
 3. **Push no iPhone** (notificação no celular via PWA)
 
-> ⚠️ Não recriar avisos no lado do navegador (client-side push) para `call_started`/`call_analyzed` — isso já foi removido. Se voltar, gera **alertas duplicados**.
+### 5.7. Emergências
+Depois que o cliente aceita a taxa de emergência ($120), a Sarah oferece duas opções: **(a) agendar** a visita mais próxima ou **(b) transferir agora** para o técnico de plantão. Na transferência ela *oferece* (sem obrigar) coletar nome/endereço/e-mail antes. O destino é o contato de emergência definido no dashboard, com fallback para o técnico fixo de plantão.
 
 ---
 
-## 6. Problemas que encontramos e como resolvemos
+## 6. Decisões importantes e por quê (histórico)
 
-Esta seção é o "histórico de guerra". Entender isto evita repetir os mesmos erros.
+Esta seção explica **por que o sistema é do jeito que é hoje** — entender isto ajuda a não desfazer escolhas que já foram pensadas.
 
-### 6.1. O fluxo antigo (conversation flow) não funcionava
-- **Problema:** a v1 era um grafo de nós, frágil e difícil de ajustar.
-- **Solução:** reescrevemos como **agente de prompt único** (Sarah v2). Muito mais flexível.
+- **Agente de prompt único (Sarah v2):** substituiu o fluxo de nós antigo, que era frágil. Mais flexível e fácil de iterar. (Ver seção 3.)
+- **Dedupe de cliente + confirmação garantida pelo servidor:** o agendamento procura o cliente pelo telefone e reaproveita o cadastro (evita clientes duplicados e endereços/e-mails errados). Além disso, o servidor **só agenda depois que a identidade é confirmada** — essa garantia fica no código, não só no prompt, porque instruções de prompt sozinhas não eram suficientes para algo tão crítico.
+- **Estado persistente em `DATA_DIR`:** dados que precisam sobreviver a um redeploy (escala de plantão, mensagens, contatos de transferência) ficam no volume persistente da Railway — não em memória nem em `/tmp`.
+- **Alertas unificados no `notify_event()`:** um único ponto dispara Telegram + Central de Mensagens + push, com o mesmo conteúdo, evitando duplicação e inconsistência.
+- **`server.py` é fonte única da verdade:** o código de produção e o de desenvolvimento são mantidos **idênticos** (ver seção 8). A pasta `deploy/` é só o "veículo" que leva o código pra Railway.
 
-### 6.2. Cliente duplicado e endereço/e-mail inventados (o maior bug)
-- **Problema:** a função `create_appointment` **criava um cliente novo na HCP toda ligação**, sem procurar se ele já existia. Resultado: para um mesmo número de teste, **acumularam 9 cadastros duplicados**; e em clientes recorrentes a Sarah **alucinava o endereço do escritório** (6148 Hanging Moss Rd) e **inventava um e-mail**.
-- **Solução:** no início da ligação (`/retell/inbound`), passamos a **procurar o cliente pelo número de telefone** na HCP (em paralelo, com prazo de 2,5s) e devolver os dados dele. A Sarah confirma a identidade e o número da casa (dígito por dígito, sem ler a rua inteira em voz alta), só pede e-mail se faltar, e o `create_appointment` **reaproveita** o cadastro existente em vez de criar outro.
-
-### 6.3. Confirmar só pelo prompt não bastava
-- **Problema:** mesmo instruída no prompt a confirmar a identidade antes de agendar, a Sarah **continuava agendando em silêncio** (falhou 3 vezes seguidas).
-- **Solução:** **forçamos no servidor.** Agora, se existe um perfil encontrado, o `create_appointment` **se recusa a agendar** a menos que o agente envie `profile_confirmed: true`. Caso contrário, devolve uma instrução pra Sarah perguntar e tentar de novo. Regra que importa: não dá pra confiar só no prompt para coisas críticas — o servidor precisa garantir.
-- **Pendência:** os 9 duplicados antigos do número de teste **ainda não foram limpos** (a limpeza foi adiada pelo Miguel). Enquanto isso, a busca pega o cadastro mais recente e o passo de confirmação corrige.
-
-### 6.4. Alertas migraram de Twilio (SMS) → Telegram → unificado
-- **Problema:** os alertas começaram via **Twilio (SMS)**, que era limitado/caro.
-- **Solução:** trocamos por **Telegram**, e depois unificamos tudo no `notify_event()` (Telegram + Central de Mensagens + push no iPhone).
-- ⚠️ **Cuidado que sobrou:** o `server.py` da pasta **`deploy/` já usa Telegram**, mas o `server.py` da **raiz ainda usa o Twilio antigo** (ver seção 7 — divergência).
-
-### 6.5. Escala de plantão era apagada a cada deploy
-- **Problema:** a escala de on-call era salva em `/tmp`, que a Railway **apaga a cada redeploy**. Por isso a Sarah "ignorava" o técnico de plantão escolhido.
-- **Solução:** passamos a salvar no `DATA_DIR` (volume persistente da Railway).
-
-### 6.6. Alertas do Telegram não chegavam
-- **Problema:** dois motivos — (1) token/chat_id **de placeholder** no `.env`/Railway; (2) **imagem velha** rodando na Railway (ainda com o código do Twilio).
-- **Solução:** colocar os valores reais e **fazer o deploy de verdade** (ver recipe na seção 7).
-
-### 6.7. Bugs menores de dashboard
-- **SVG sem classe** renderizava no tamanho padrão 300×150 do navegador e estourava o layout. Solução: todo ícone SVG **precisa** de `class="icon|icon-sm|icon-xs"`, e existe um CSS defensivo de fallback.
-- **Push duplicado:** alertas chegavam em dobro porque havia push no servidor **e** no navegador. Solução: removemos o push do lado do navegador.
+> Os detalhes técnicos mais finos (e os cuidados de operação) ficam no `CLAUDE.md`, que é a referência para quem vai mexer no código.
 
 ---
 
-## 7. Erros que ainda podem acontecer (pontos de atenção)
-
-Leia com atenção — são as armadilhas ativas do projeto.
-
-### 7.1. ⚠️ A pegadinha mais perigosa: divergência entre `deploy/` e a raiz
-Existem **dois repositórios Git na mesma pasta**:
-- **Raiz** (`./.git`) → workspace de desenvolvimento. **Está ATRASADO** e o `server.py` da raiz ainda usa **Twilio**, sem os subsistemas novos.
-- **`deploy/`** (`deploy/.git`) → **é o código que realmente roda em produção** (~7,5 mil linhas, com Telegram, Central de Mensagens, push, lookup de cliente, verificação de assinatura, etc.).
-
-➡️ **NUNCA fazer `cp server.py deploy/server.py` (cópia cega).** Isso **reverteria a produção** pro código antigo do Twilio e destruiria todo o trabalho de notificações/transferência/push. **Toda mudança deve ser feita no `deploy/server.py`** (e, se quiser, espelhada na raiz). Algum dia os dois devem ser unificados num só.
-
-### 7.2. ⚠️ `railway up` trava em "Indexing..."
-- Rodar `railway up` direto de dentro de `deploy/` **trava para sempre** em "Indexing...", porque ele tropeça nas pastas `.worktrees/` e `.git` aninhadas.
-- **Solução (recipe de deploy limpo):** copiar só os arquivos de runtime pra uma pasta limpa e fazer o deploy de lá:
-  ```bash
-  mkdir -p /tmp/hvac-clean-deploy
-  cp deploy/server.py deploy/Procfile deploy/requirements.txt deploy/logo.png /tmp/hvac-clean-deploy/
-  cp -r deploy/assets /tmp/hvac-clean-deploy/
-  cd deploy && git add -A && git commit -m "..."
-  railway up "/tmp/hvac-clean-deploy" --path-as-root --service "HVAC Retell Alfredo" --ci
-  ```
-- Conferir depois com `railway logs --service "HVAC Retell Alfredo"`.
-
-### 7.3. Outros riscos
-- **Verificação de assinatura** ainda está em `monitor` — falta virar pra `enforce` (os endpoints estão "abertos" até lá).
-- **9 cadastros duplicados** do número de teste ainda não foram limpos na HCP.
-- **Não aumentar workers** na Railway (quebra o painel ao vivo).
-- **Version drift na Retell** — sempre confirmar qual versão está realmente publicada.
-- **`urllib` falha por certificado** — usar `curl` para a API da Retell.
-- **Segredos só vivem no `.env` e na Railway** — nunca commitar `.env`.
-
----
-
-## 8. Variáveis de ambiente (onde ficam as credenciais)
+## 7. Variáveis de ambiente (onde ficam as credenciais)
 
 Tudo vive no `.env` (local) e nas variáveis da Railway (produção). **Nunca commitar.** As principais:
 
@@ -242,29 +177,22 @@ Tudo vive no `.env` (local) e nas variáveis da Railway (produção). **Nunca co
 | `DASHBOARD_PASSWORD` | Senha (`?key=`) pra abrir o dashboard |
 | `TELEGRAM_BOT_TOKEN` | Bot de alertas do Telegram |
 | `ANTHROPIC_API_KEY` | Revisor de qualidade de ligações (IA) |
-| `RETELL_VERIFY_MODE` | `off`/`monitor`/`enforce` da verificação de assinatura |
 | `MIN_BOOKING_LEAD_HOURS` | Antecedência mínima pra agendamentos normais |
 | `INBOUND_CONTEXT_SKIP_NUMBERS` | Números que não ouvem "bem-vindo de volta" (ex.: número de teste) |
 | `DATA_DIR` | Pasta de dados persistentes (volume da Railway) |
 
----
-
-## 9. URLs de produção
-
-- **Dashboard:** `https://hvac-retell-alfredo-production.up.railway.app/dashboard?key=<DASHBOARD_PASSWORD>`
-- **Análises:** `/analytics?key=<DASHBOARD_PASSWORD>`
-- **Webhooks da Retell:** `/webhook/retell`, `/retell/inbound`
-- **Tools:** `/check-availability`, `/create-appointment`, `/transfer-emergency`
-- **Saúde do servidor:** `/health`
+Há um `.env.example` no repositório com a lista completa de nomes (sem valores).
 
 ---
 
-## 10. Estrutura de pastas
+## 8. Estrutura de pastas
 
 ```
-server.py            ← app do workspace (NÃO é o que a Railway roda — ver seção 7)
-logo.png, .env, Procfile, requirements.txt, CLAUDE.md   ← ficam na raiz (operacionais)
-deploy/              ← CÓDIGO QUE RODA EM PRODUÇÃO + seu próprio repo Git
+server.py            ← O app, a FONTE DA VERDADE (idêntico ao que roda em produção)
+logo.png, assets/    ← imagens servidas pelo dashboard
+.env, Procfile, requirements.txt, CLAUDE.md   ← ficam na raiz (operacionais)
+deploy/              ← "veículo" de deploy: repo Git separado, ligado à Railway
+                       (seu server.py é mantido igual ao da raiz)
 data/                ← estado local (SQLite + json)
 
 knowledge_base/      base de conhecimento da empresa (txt)
@@ -280,14 +208,24 @@ docs/                pesquisa de mercado, notas de deploy, contexto do Telegram,
 
 ---
 
-## 11. Por onde começar (primeiros passos)
+## 9. URLs de produção
 
-1. Ler **este documento** inteiro, depois o `CLAUDE.md` (versão técnica em inglês).
-2. Pedir ao Miguel: acesso ao `.env` (credenciais), à Railway, à conta da Retell e à Housecall Pro.
-3. Abrir o **dashboard de produção** e observar uma ligação ao vivo de teste pra ver tudo funcionando.
+- **Dashboard:** `https://hvac-retell-alfredo-production.up.railway.app/dashboard?key=<DASHBOARD_PASSWORD>`
+- **Análises:** `/analytics?key=<DASHBOARD_PASSWORD>`
+- **Webhooks da Retell:** `/webhook/retell`, `/retell/inbound`
+- **Tools:** `/check-availability`, `/create-appointment`, `/transfer-emergency`
+- **Saúde do servidor:** `/health`
+
+---
+
+## 10. Por onde começar (primeiros passos)
+
+1. Ler **este documento** inteiro, depois o `CLAUDE.md` (versão técnica em inglês, com os detalhes de operação e deploy).
+2. Pedir ao Miguel: acesso ao `.env` (credenciais), à Railway, à conta da Retell e à Housecall Pro. (As credenciais **não** vêm no repositório — são passadas à parte.)
+3. Abrir o **dashboard de produção** e observar uma ligação de teste ao vivo pra ver tudo funcionando.
 4. Ler o prompt atual em `retell/planning/retell_agent_prompt_v2.md`.
-5. Antes de qualquer deploy: reler a **seção 7** (as duas pegadinhas) — é onde mais se erra.
-6. Para testar a Sarah: fazer uma **ligação real** pro número da empresa (usar o número de teste cadastrado em `INBOUND_CONTEXT_SKIP_NUMBERS` pra não ouvir "bem-vindo de volta").
+5. Para testar a Sarah: fazer uma **ligação real** pro número da empresa (usar o número de teste cadastrado em `INBOUND_CONTEXT_SKIP_NUMBERS` pra não ouvir "bem-vindo de volta").
+6. Antes de qualquer deploy, ler a seção "Deploy model" do `CLAUDE.md`.
 
 ---
 

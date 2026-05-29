@@ -11,22 +11,21 @@ The voice agent runs on Retell's platform; this repo is the webhook/tool backend
 | If you want… | Read |
 |---|---|
 | 🇧🇷 **Onboarding (Portuguese)** — full project walkthrough for new team members | [`docs/RESUMO_PROJETO_PT.md`](docs/RESUMO_PROJETO_PT.md) |
-| 🇺🇸 **Technical guide (English)** — architecture, deploy model, Retell API workflow, gotchas | [`CLAUDE.md`](CLAUDE.md) |
-| What actually runs in production | [`live-production/`](live-production/) |
+| 🇺🇸 **Technical guide (English)** — architecture, deploy model, Retell API workflow | [`CLAUDE.md`](CLAUDE.md) |
 | The voice agent's prompt | [`retell/planning/retell_agent_prompt_v2.md`](retell/planning/retell_agent_prompt_v2.md) |
 
-## ⚠️ Two things to know before touching anything
+## Two things to know before touching anything
 
-1. **`deploy/` is the canonical live code, and it's ahead of root `server.py`.** Never blind-copy
-   root → deploy. See `CLAUDE.md` → "Deploy model" and `docs/RESUMO_PROJETO_PT.md` → section 7.
+1. **`server.py` is the single source of truth and is identical to production.** To deploy, copy
+   it into the separate `deploy/` repo and run `railway up` — see `CLAUDE.md` → "Deploy model".
+   Never edit `deploy/server.py` directly.
 2. **Secrets live only in `.env` (gitignored) and on Railway** — never commit credentials.
    Copy `.env.example` to `.env` and fill in real values to run locally.
 
 ## Layout
 
 ```
-server.py            dev-workspace app (behind production — see live-production/)
-live-production/     read-only snapshot of what Railway runs
+server.py            THE app (single source of truth, identical to production)
 CLAUDE.md            technical guide (English)
 docs/                onboarding (PT), market research, deploy notes, test plans
 retell/planning/     agent prompt v2, tool definitions, simulation suite

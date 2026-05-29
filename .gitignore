@@ -9,7 +9,7 @@ __pycache__/
 .worktrees/
 
 # The deploy/ separate git repo is NOT tracked here (it's its own repo linked to Railway).
-# A read-only snapshot of the live code lives in live-production/ — see its README.
+# It's just a deploy vehicle; its server.py is kept identical to the root server.py.
 deploy/
 
 # Local runtime state (SQLite, persisted json) — not source

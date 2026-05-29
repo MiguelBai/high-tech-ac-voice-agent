@@ -23,12 +23,13 @@ The current agent is **"Sarah v2 — High Tech AC (single-prompt)"** — a singl
 The dev workspace was reorganized into folders; **operational files stay at the repo root** because the running server and deploy tooling read them relative to themselves — do not move these:
 
 ```
-server.py            ← the dev-workspace app (see deploy note below — this is NOT what Railway runs)
+server.py            ← THE app and single source of truth (kept identical to production)
 logo.png             ← read by server.py relative to __file__ (_load_logo_data_uri)
+assets/              ← app icons + logo served by the dashboard/PWA
 .env / .env.example  ← creds loaded from cwd
 Procfile, requirements.txt
 CLAUDE.md            ← only auto-loaded by Claude Code from the repo root
-deploy/              ← the canonical LIVE app + its own git repo (see below)
+deploy/              ← deploy vehicle only: a separate git repo linked to Railway (see below)
 data/                ← local SQLite + json state (DATA_DIR fallback)
 
 knowledge_base/      High_Tech_AC_Knowledge_Base.txt, KB_UPDATE_gas-CO-safety.txt
@@ -45,37 +46,31 @@ docs/                market research, DEPLOY_profile_lookup.md, TELEGRAM_BOT_CON
 
 Generators are one-off client-deliverable scripts (not deploy artifacts). Run them from the repo root so relative paths (e.g. `logo.png`) resolve, e.g. `python3 proposals/generators/generate_proposal.py`.
 
-## ⚠️ Deploy model — read this before deploying
+## Deploy model
 
-There are **two git repos in one tree, and `deploy/` is now AHEAD of root** (the relationship is the reverse of how this project started):
+There are **two git repos in one tree**, but they are now **kept in sync** — the old divergence (root behind on Twilio, deploy ahead on Telegram) has been **reconciled**: root `server.py` is byte-identical to production and the dead Twilio path was removed.
 
-- **`deploy/server.py` is the canonical, live, feature-complete app** (~7.5k lines). It has: Telegram alerting, the unified `notify_event()` fan-out, the Message Center, web push, returning-caller HCP profile lookup + dedupe, the transfer-contact manager, Retell signature verification, and the dark/cyan dashboard redesign.
-- **Root `server.py` is BEHIND** (~5.5k lines). It still uses the old **Twilio SMS** notification path (`send_sms_alert`) and lacks the transfer-contacts, Message Center, push, and signature-verification subsystems entirely.
+- **Root `server.py` is the single source of truth.** Edit here. It is the full, current, feature-complete app (Telegram + unified `notify_event()`, Message Center, web push, returning-caller HCP profile lookup + dedupe, transfer-contact manager, Retell signature verification, dark/cyan dashboard).
+- **`deploy/` is only a deploy vehicle** — a separate git repo whose Railway project link lives in Railway's global config. Its `server.py` must always match root.
 
-**Therefore: do NOT `cp server.py deploy/server.py`.** A blind copy reverts production to Twilio and destroys the notification/transfer/push work. The old "edit root → copy to deploy" instruction is dead.
+**The rule that keeps them from diverging again: never edit `deploy/server.py` directly. Edit root, then copy it over.**
 
-**To ship a change:** make the edit in **`deploy/server.py`** (and mirror to root only if you want to eventually reconcile them — they should be merged into one canonical source someday). For surgical ports, use string-replacement with `count == 1` assertions so drift fails loudly.
-
-### Railway deploy recipe (the `railway up` indexing-hang workaround)
-
-`railway up` run directly from `deploy/` **hangs forever at `Indexing...`** — it chokes walking the nested `.worktrees/` and `.git` pointer files even though they're gitignored. Deploy from a clean staging dir instead:
+### Deploy steps
 
 ```bash
-# 1. Copy only runtime files to a clean dir (no .git, no .worktrees)
-mkdir -p /tmp/hvac-clean-deploy
-cp deploy/server.py deploy/Procfile deploy/requirements.txt deploy/logo.png /tmp/hvac-clean-deploy/
-cp -r deploy/assets /tmp/hvac-clean-deploy/
-
-# 2. Commit in deploy/ for history (the Railway project link lives there)
+# 1. Sync the deploy vehicle from the source of truth, then commit it for history
+cp server.py deploy/server.py && cp Procfile deploy/ && cp requirements.txt deploy/ \
+  && cp logo.png deploy/ && cp -r assets deploy/
 cd deploy && git add -A && git commit -m "..."
 
-# 3. Deploy the clean dir, non-interactive, streaming logs (~30–90s build)
-PATH="$HOME/.npm-global/bin:$PATH" railway up "/tmp/hvac-clean-deploy" \
-  --path-as-root --service "HVAC Retell Alfredo" --ci
+# 2. Deploy (~30–90s build)
+PATH="$HOME/.npm-global/bin:$PATH" railway up --detach --service "HVAC Retell Alfredo"
 ```
 
 - Railway service: **`HVAC Retell Alfredo`** — service id `f019df56-b420-4f84-91b1-2df3090a6d99`, project id `1080d269-c15c-44ee-adbb-dc42306f9166`.
 - After deploy, sanity-check with `railway logs --service "HVAC Retell Alfredo"`.
+
+> **Historical note (no longer an active hazard):** `railway up` from `deploy/` used to hang forever at `Indexing...` because it choked on a nested abandoned git worktree under `deploy/.worktrees/`. That worktree has been removed, so `railway up` works normally. If indexing ever hangs again, check `git -C deploy worktree list` for stray worktrees, or fall back to deploying a clean copy of only the runtime files (`server.py Procfile requirements.txt logo.png assets/`) via `railway up "<clean-dir>" --path-as-root --service "HVAC Retell Alfredo" --ci`.
 
 ## Architecture — why it's shaped this way
 

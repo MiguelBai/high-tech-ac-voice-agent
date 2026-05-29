@@ -9,12 +9,12 @@ import os
 import json
 import queue
 import base64
+import uuid
 import sqlite3
 import threading
 import gevent
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from urllib.parse import urlencode
 from flask import Flask, request, jsonify, Response, render_template_string
 import requests
 from dotenv import load_dotenv
@@ -81,50 +81,263 @@ SERVICE_AREA = [
     "Clermont", "Windermere", "Doctor Phillips", "Celebration", "Lake Buena Vista",
 ]
 
-# Owner phone number for live takeover (set as env var on Railway)
-OWNER_PHONE = os.environ.get("OWNER_PHONE", "")
 DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD", "hvac2026")
+DASHBOARD_PUBLIC_URL = os.environ.get("DASHBOARD_PUBLIC_URL", "https://hvac-retell-alfredo-production.up.railway.app")
 
-# Twilio SMS notifications on call start
+# ── Retell request authenticity (X-Retell-Signature) ───────────────────────────
+# Retell signs its requests: header "v={unix_ms},d={hex}" where hex =
+# HMAC-SHA256(api_key, raw_body + unix_ms). We verify so nobody who guesses the
+# Railway URLs can POST fake bookings / fire emergency Telegram alerts.
+# Rollout is staged via RETELL_VERIFY_MODE so we never break live traffic if a
+# given request type turns out not to be signed:
+#   off     — skip entirely
+#   monitor — verify + log result, but ALWAYS process (default; safe to deploy)
+#   enforce — reject (401) when the signature is missing/invalid
+import hmac as _hmac
+import hashlib as _hashlib
+import re as _sig_re
+from functools import wraps as _wraps
+
+RETELL_VERIFY_MODE = os.environ.get("RETELL_VERIFY_MODE", "monitor").strip().lower()
+
+
+def _retell_signature_valid(raw_body, signature):
+    if not RETELL_API_KEY or RETELL_API_KEY == "YOUR_RETELL_API_KEY":
+        return False
+    m = _sig_re.match(r"\s*v=(\d+),\s*d=([0-9a-fA-F]+)\s*$", signature or "")
+    if not m:
+        return False
+    ts, digest = m.group(1), m.group(2)
+    body = raw_body.decode("utf-8", "replace") if isinstance(raw_body, (bytes, bytearray)) else (raw_body or "")
+    expected = _hmac.new(RETELL_API_KEY.encode("utf-8"), (body + ts).encode("utf-8"), _hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(expected.lower(), digest.lower())
+
+
+def require_retell_signature(fn):
+    """Gate a Retell-facing endpoint on the X-Retell-Signature header (see RETELL_VERIFY_MODE)."""
+    @_wraps(fn)
+    def _wrap(*args, **kwargs):
+        if RETELL_VERIFY_MODE == "off":
+            return fn(*args, **kwargs)
+        sig = request.headers.get("X-Retell-Signature", "")
+        raw = request.get_data(cache=True) or b""   # cache=True so request.json still works downstream
+        if _retell_signature_valid(raw, sig):
+            logger.info(f"[retell-verify] ok {request.path}")
+            return fn(*args, **kwargs)
+        reason = "missing" if not sig else "mismatch"
+        if RETELL_VERIFY_MODE == "enforce":
+            logger.warning(f"[retell-verify] REJECTED {request.path} ({reason})")
+            return jsonify({"error": "invalid signature"}), 401
+        logger.warning(f"[retell-verify] monitor: {request.path} signature {reason} — allowing "
+                       "(set RETELL_VERIFY_MODE=enforce to block once all 5 Retell endpoints log 'ok')")
+        return fn(*args, **kwargs)
+    return _wrap
+
+
 def _clean_env(v: str) -> str:
     """Strip whitespace + stray unicode separators that can sneak in from copy-paste."""
     if not v:
         return ""
-    return "".join(c for c in v if c not in (" ", " ", " ", "﻿")).strip()
-
-TWILIO_SID = _clean_env(os.environ.get("TWILIO_SID", ""))
-TWILIO_TOKEN = _clean_env(os.environ.get("TWILIO_TOKEN", ""))
-TWILIO_FROM = _clean_env(os.environ.get("TWILIO_FROM", ""))
-SMS_RECIPIENTS = [_clean_env(n) for n in os.environ.get("SMS_RECIPIENTS", "").split(",") if _clean_env(n)]
-DASHBOARD_PUBLIC_URL = os.environ.get("DASHBOARD_PUBLIC_URL", "https://hvac-retell-alfredo-production.up.railway.app")
+    return "".join(c for c in v if not c.isspace() or c == " ").strip()
 
 
-def send_sms_alert(message: str):
-    """Send SMS to every number in SMS_RECIPIENTS via Twilio. Non-blocking — failures logged, not raised."""
-    if not (TWILIO_SID and TWILIO_TOKEN and TWILIO_FROM and SMS_RECIPIENTS):
-        logger.info("[sms] skipped - Twilio not configured")
+# Telegram bot notifications
+TELEGRAM_BOT_TOKEN = _clean_env(os.environ.get("TELEGRAM_BOT_TOKEN", ""))
+TELEGRAM_CHAT_ID = _clean_env(os.environ.get("TELEGRAM_CHAT_ID", ""))
+
+# Web Push (iPhone home-screen PWA banners). Keys live in Railway → Variables.
+VAPID_PUBLIC_KEY = _clean_env(os.environ.get("VAPID_PUBLIC_KEY", ""))
+VAPID_PRIVATE_KEY = _clean_env(os.environ.get("VAPID_PRIVATE_KEY", ""))
+VAPID_SUBJECT = _clean_env(os.environ.get("VAPID_SUBJECT", "mailto:alerts@hightechacfl.com"))
+
+# Human-transfer destinations — changeable in Railway → Variables (no redeploy needed).
+# Both default to Alfredo's cell for now; can be pointed at different numbers later.
+ALFREDO_TRANSFER_PHONE = _clean_env(os.environ.get("ALFREDO_TRANSFER_PHONE", "+19546696259"))
+HUMAN_TRANSFER_PHONE = _clean_env(os.environ.get("HUMAN_TRANSFER_PHONE", "+19546696259"))
+
+# Minimum lead time before a NON-emergency appointment may start. Emergencies are
+# handled via transfer, not booked here, so this only gates regular scheduling.
+MIN_BOOKING_LEAD_HOURS = int(os.environ.get("MIN_BOOKING_LEAD_HOURS", "12"))
+
+
+def send_telegram_alert(message: str, parse_mode: str = "Markdown"):
+    """Send a Telegram message to TELEGRAM_CHAT_ID. Non-blocking — failures logged, not raised."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        logger.info("[telegram] skipped - not configured")
         return
-    # Sanitize: strip unicode line separators + replace em/en dashes with hyphen for SMS compatibility
-    clean = (message
-             .replace(" ", " ").replace(" ", " ")
-             .replace("—", "-").replace("–", "-"))
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
-    for to in SMS_RECIPIENTS:
-        try:
-            body = urlencode({"From": TWILIO_FROM, "To": to, "Body": clean}).encode("utf-8")
-            r = requests.post(
-                url,
-                auth=(TWILIO_SID, TWILIO_TOKEN),
-                data=body,
-                headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
-                timeout=5,
-            )
-            if r.status_code >= 300:
-                logger.warning(f"[sms] {to} failed {r.status_code}: {r.text[:200]}")
-            else:
-                logger.info(f"[sms] sent to {to}")
-        except Exception as e:
-            logger.warning(f"[sms] {to} exception: {e}")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        r = requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True,
+            },
+            timeout=5,
+        )
+        if r.status_code >= 300:
+            logger.warning(f"[telegram] failed {r.status_code}: {r.text[:200]}")
+        else:
+            logger.info("[telegram] sent")
+    except Exception as e:
+        logger.warning(f"[telegram] exception: {e}")
+
+
+def _format_call_ended_alert(c):
+    """Build the end-of-call Telegram summary (HTML) from an ACTIVE_CALLS entry.
+    Uses the analyzed call data (summary, outcome, priority, follow-up) plus any
+    booking made on the call. HTML parse mode so free-text fields escape cleanly."""
+    import html
+    e = html.escape
+    analysis = c.get("analysis") or {}
+    custom = analysis.get("custom_analysis_data") or {}
+    booking = c.get("booking_summary") or {}
+
+    summary = (analysis.get("call_summary") or "").strip()
+    outcome = (custom.get("outcome") or "").strip()
+    priority = (custom.get("priority") or "").strip().upper()
+    sentiment = (analysis.get("user_sentiment") or "").strip()
+    should_followup = custom.get("should_followup")
+    followup_reason = (custom.get("followup_reason") or "").strip()
+    lead_source = (custom.get("lead_source") or "").strip()
+
+    # Name: prefer the booked customer name, else the name extracted by analysis.
+    name = (booking.get("customer_name") or custom.get("caller_name") or "").strip()
+    caller = c.get("from_number") or "unknown"
+
+    dur_ms = c.get("duration_ms") or 0
+    mins, secs = divmod(int(dur_ms / 1000), 60)
+    dur = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+    prio_emoji = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(priority, "✅")
+    outcome_disp = outcome.replace("_", " ").title() if outcome else "Call ended"
+
+    lines = [f"{prio_emoji} <b>Call ended — {e(outcome_disp)}</b>"]
+    lines.append(f"👤 {e(name) if name else 'Name not given'}  ·  <code>{e(caller)}</code>")
+    if summary:
+        lines.append(f"📋 {e(summary)}")
+    if lead_source:
+        lines.append(f"📣 Heard via: {e(lead_source)}")
+    if booking:
+        lines.append(
+            f"🗓 <b>Booked:</b> {e(booking.get('service_type',''))} — "
+            f"{e(booking.get('date',''))}, {e(booking.get('time_window',''))}\n"
+            f"     Tech: {e(booking.get('tech',''))} · {e(booking.get('address',''))}"
+        )
+        if c.get("hcp_job_url"):
+            lines.append(f"     <a href=\"{e(c['hcp_job_url'])}\">Open HCP job</a>")
+        # Ready-to-send confirmation text the tech can copy and send to the customer.
+        first = name.split()[0] if name else "there"
+        confirm = (
+            f"Hi {first}, this is High Tech Air Conditioning confirming your "
+            f"{booking.get('service_type','')} appointment on {booking.get('date','')}, "
+            f"{booking.get('time_window','')}, at {booking.get('address','')}. "
+            f"Reply to confirm, or let us know if you need to reschedule. See you then!"
+        )
+        lines.append(f"📲 <b>Confirmation text to send:</b>\n<pre>{e(confirm)}</pre>")
+    meta = []
+    if dur_ms:
+        meta.append(f"⏱ {dur}")
+    if sentiment:
+        meta.append(e(sentiment.title()))
+    if meta:
+        lines.append("  ·  ".join(meta))
+    if should_followup:
+        lines.append(f"🔔 <b>Follow up</b>{(': ' + e(followup_reason)) if followup_reason else ''}")
+    dash = f"{DASHBOARD_PUBLIC_URL}/dashboard?key={DASHBOARD_PASSWORD}"
+    lines.append(f"<a href=\"{e(dash)}\">View on dashboard</a>")
+    return "\n".join(lines)
+
+
+def _format_call_ended_plain(c):
+    """Plain-text (ico, title, body) mirror of the Telegram wrap-up, for the
+    dashboard message center and the iPhone push banner (no HTML/Markdown)."""
+    analysis = c.get("analysis") or {}
+    custom = analysis.get("custom_analysis_data") or {}
+    booking = c.get("booking_summary") or {}
+
+    summary = (analysis.get("call_summary") or "").strip()
+    outcome = (custom.get("outcome") or "").strip()
+    priority = (custom.get("priority") or "").strip().upper()
+    should_followup = custom.get("should_followup")
+    name = (booking.get("customer_name") or custom.get("caller_name") or "").strip()
+    caller = c.get("from_number") or "unknown"
+
+    ico = {"HIGH": "🔴", "MEDIUM": "🟡", "LOW": "🟢"}.get(priority, "✅")
+    # Only append the outcome when there's a real one — otherwise it reads "Call ended — Call ended".
+    title = f"Call ended — {outcome.replace('_', ' ').title()}" if outcome else "Call ended"
+
+    parts = [name or caller]
+    if booking:
+        bk = f"Booked {booking.get('service_type','')} {booking.get('date','')} {booking.get('time_window','')}".strip()
+        parts.append(" ".join(bk.split()))
+    elif summary:
+        parts.append(summary)
+    if should_followup:
+        parts.append("Needs follow-up")
+    body = " · ".join(p for p in parts if p)
+    return ico, title, body
+
+
+def _call_meta(c):
+    """Structured fields for the in-app message bubble — everything that's in the
+    Telegram wrap-up (name, number, summary, duration, follow-up, booking, the
+    ready-to-send confirmation text, HCP link), so the client can render it nicely
+    and offer Call/Text/Copy/HCP/View-call actions."""
+    analysis = c.get("analysis") or {}
+    custom = analysis.get("custom_analysis_data") or {}
+    booking = c.get("booking_summary") or {}
+
+    summary = (analysis.get("call_summary") or "").strip()
+    outcome = (custom.get("outcome") or "").strip()
+    priority = (custom.get("priority") or "").strip().upper()
+    sentiment = (analysis.get("user_sentiment") or "").strip()
+    should_followup = bool(custom.get("should_followup"))
+    followup_reason = (custom.get("followup_reason") or "").strip()
+    lead_source = (custom.get("lead_source") or "").strip()
+    name = (booking.get("customer_name") or custom.get("caller_name") or "").strip()
+    caller = c.get("from_number") or ""
+
+    dur_ms = c.get("duration_ms") or 0
+    mins, secs = divmod(int(dur_ms / 1000), 60)
+    dur = (f"{mins}m {secs}s" if mins else f"{secs}s") if dur_ms else ""
+
+    bk, confirm = None, ""
+    if booking:
+        first = name.split()[0] if name else "there"
+        confirm = (
+            f"Hi {first}, this is High Tech Air Conditioning confirming your "
+            f"{booking.get('service_type','')} appointment on {booking.get('date','')}, "
+            f"{booking.get('time_window','')}, at {booking.get('address','')}. "
+            f"Reply to confirm, or let us know if you need to reschedule. See you then!"
+        )
+        bk = {
+            "service_type": booking.get("service_type", ""),
+            "date": booking.get("date", ""),
+            "time_window": booking.get("time_window", ""),
+            "tech": booking.get("tech", ""),
+            "address": booking.get("address", ""),
+        }
+    return {
+        "kind": "ended",
+        "name": name,
+        "phone": caller,
+        "outcome": outcome.replace("_", " ").title() if outcome else "",
+        "priority": priority,
+        "summary": summary,
+        "lead_source": lead_source,
+        "duration": dur,
+        "sentiment": sentiment.title() if sentiment else "",
+        "followup": should_followup,
+        "followup_reason": followup_reason,
+        "booking": bk,
+        "hcp_url": c.get("hcp_job_url") or "",
+        "confirm_text": confirm,
+        "call_id": c.get("call_id", ""),
+    }
+
 
 # Services that CANNOT be booked — collect info only
 DO_NOT_BOOK_SERVICES = ["duct cleaning"]
@@ -135,8 +348,12 @@ RETELL_AGENT_ID   = os.environ.get("RETELL_AGENT_ID", "")
 REVIEW_MODEL      = os.environ.get("REVIEW_MODEL", "claude-haiku-4-5")
 SYNTH_MODEL       = os.environ.get("SYNTH_MODEL", "claude-opus-4-7")
 REVIEW_INTERVAL_S = int(os.environ.get("REVIEW_INTERVAL_S", "300"))   # 5 min
+STALE_ACTIVE_SECONDS = int(os.environ.get("STALE_ACTIVE_SECONDS", "7200"))  # 2h — no real call runs this long
 SYNTH_HOUR_LOCAL  = int(os.environ.get("SYNTH_HOUR_LOCAL", "8"))      # 8 AM Eastern
 DATA_DIR = os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
+if not str(DATA_DIR).startswith("/data"):
+    logger.warning(f"[startup] DATA_DIR={DATA_DIR} is NOT the Railway volume (/data). "
+                   "On-call schedule, transfer contacts, and calls.db will NOT persist across redeploys.")
 DB_PATH  = os.path.join(DATA_DIR, "calls.db")
 
 
@@ -539,6 +756,7 @@ def reviewer_loop():
     logger.info(f"[reviewer] loop started (every {REVIEW_INTERVAL_S}s, model={REVIEW_MODEL})")
     while True:
         try:
+            _reconcile_stale_active(broadcast=True)  # sweep stuck-active calls every cycle
             ids = db_unreviewed_call_ids(limit=10)
             for cid in ids:
                 review_one_call(cid)
@@ -938,8 +1156,44 @@ def hydrate_active_calls():
             c = db_call_to_dict(r)
             ACTIVE_CALLS[c["call_id"]] = c
         logger.info(f"[hydrate] loaded {len(rows)} calls from {DB_PATH}")
+        _reconcile_stale_active()  # clear any "active" call whose end-event was missed before a restart
     except Exception as e:
         logger.exception(f"[hydrate] failed: {e}")
+
+
+def _reconcile_stale_active(broadcast=False):
+    """Mark any call still 'active'/'ongoing' past the max plausible call length as ended.
+    A missed call_ended webhook (or a restart mid-call) would otherwise leave a phantom
+    'unknown' live call on the dashboard forever."""
+    now = datetime.now(LOCAL_TZ)
+    fixed = []
+    for cid, c in list(ACTIVE_CALLS.items()):
+        if c.get("state") not in ("active", "ongoing"):
+            continue
+        stale = True
+        sa = c.get("started_at")
+        if sa:
+            try:
+                stale = (now - datetime.fromisoformat(sa)).total_seconds() > STALE_ACTIVE_SECONDS
+            except Exception:
+                stale = True
+        if stale:
+            c["state"] = "ended"
+            c.setdefault("ended_at", now.isoformat())
+            try:
+                db_upsert_call(c)
+            except Exception:
+                pass
+            fixed.append(cid)
+    if fixed:
+        logger.info(f"[stale] reconciled {len(fixed)} stuck-active call(s)")
+        if broadcast:
+            for cid in fixed:
+                try:
+                    broadcast_event("call_ended", ACTIVE_CALLS[cid])
+                except Exception:
+                    pass
+    return fixed
 
 
 # ACTIVE_CALLS is defined later; hydration runs after that block — see _start_background_jobs()
@@ -1059,8 +1313,20 @@ def get_busy_hours_by_tech(start_date, end_date):
         "work_status[]": "scheduled",
         "page_size": 200,
     }
-    data = hcp_get("/jobs", params=params)
-    existing_jobs = data.get("jobs", [])
+    # Paginate — a single 200-job page silently dropped later jobs in a busy week,
+    # making occupied hours look free → double-booking. Loop until a short page (cap 10 pages).
+    existing_jobs = []
+    page = 1
+    while page <= 10:
+        params["page"] = page
+        data = hcp_get("/jobs", params=params)
+        batch = data.get("jobs", [])
+        existing_jobs.extend(batch)
+        if len(batch) < params["page_size"]:
+            break
+        page += 1
+    else:
+        logger.warning("[availability] HCP /jobs hit the 10-page cap — schedule may be incomplete")
 
     busy_by_tech = {}
     all_busy = set()  # hours where ANY tech is busy
@@ -1099,7 +1365,10 @@ def get_busy_hours_by_tech(start_date, end_date):
 # ============================================================
 # ON-CALL SCHEDULE — persisted to JSON file on Railway disk
 # ============================================================
-ONCALL_FILE = os.environ.get("ONCALL_FILE", "/tmp/oncall_schedule.json")
+# Persist to the Railway volume (DATA_DIR=/data), NOT /tmp — /tmp is wiped on every
+# redeploy/restart, which silently erased the on-call schedule (so the AI fell back to
+# all techs). DATA_DIR survives deploys.
+ONCALL_FILE = os.environ.get("ONCALL_FILE", os.path.join(DATA_DIR, "oncall_schedule.json"))
 
 def load_oncall():
     """
@@ -1167,10 +1436,193 @@ def find_available_tech(busy_by_tech, date_obj, start_hour, duration_hours):
 
 
 # ============================================================
+# TRANSFER CONTACTS — dashboard-managed numbers the AI transfers to.
+# Persisted to the Railway volume (DATA_DIR). Two roles: 'alfredo' and 'human'.
+# /retell/inbound feeds the chosen numbers into the transfer_call tools' dynamic
+# variables; falls back to the env vars when no contact is assigned to a role.
+# ============================================================
+TRANSFER_FILE = os.environ.get("TRANSFER_FILE", os.path.join(DATA_DIR, "transfer_contacts.json"))
+
+
+def load_transfer():
+    try:
+        if os.path.exists(TRANSFER_FILE):
+            with open(TRANSFER_FILE) as f:
+                d = json.load(f)
+            d.setdefault("contacts", [])
+            d.setdefault("alfredo_id", None)
+            d.setdefault("human_id", None)
+            d.setdefault("emergency_id", None)
+            return d
+    except Exception as e:
+        logger.error(f"[transfer] load failed: {e}")
+    return {"contacts": [], "alfredo_id": None, "human_id": None, "emergency_id": None}
+
+
+def save_transfer(data):
+    try:
+        with open(TRANSFER_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"[transfer] save failed: {e}")
+        return False
+
+
+# ---- Web Push (iPhone PWA notifications) ----
+PUSH_SUBS_FILE = os.environ.get("PUSH_SUBS_FILE", os.path.join(DATA_DIR, "push_subs.json"))
+
+
+def load_push_subs():
+    try:
+        if os.path.exists(PUSH_SUBS_FILE):
+            with open(PUSH_SUBS_FILE) as f:
+                return json.load(f) or []
+    except Exception as e:
+        logger.error(f"[push] load failed: {e}")
+    return []
+
+
+def save_push_subs(subs):
+    try:
+        with open(PUSH_SUBS_FILE, "w") as f:
+            json.dump(subs, f)
+    except Exception as e:
+        logger.error(f"[push] save failed: {e}")
+
+
+def send_web_push(title, body, url="/dashboard", tag="call"):
+    """Send a Web Push to every stored subscription. Fire-and-forget; prunes expired subs."""
+    if not (VAPID_PRIVATE_KEY and VAPID_PUBLIC_KEY):
+        return
+    try:
+        from pywebpush import webpush, WebPushException
+    except Exception as e:
+        logger.warning(f"[push] pywebpush unavailable: {e}")
+        return
+    subs = load_push_subs()
+    if not subs:
+        return
+    payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag})
+    keep, changed = [], False
+    for sub in subs:
+        try:
+            webpush(subscription_info=sub, data=payload,
+                    vapid_private_key=VAPID_PRIVATE_KEY,
+                    vapid_claims={"sub": VAPID_SUBJECT})
+            keep.append(sub)
+        except WebPushException as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (404, 410):
+                changed = True  # subscription gone — drop it
+                logger.info("[push] pruned expired subscription")
+            else:
+                keep.append(sub)
+                logger.warning(f"[push] send failed ({code}): {e}")
+        except Exception as e:
+            keep.append(sub)
+            logger.warning(f"[push] send error: {e}")
+    if changed:
+        save_push_subs(keep)
+
+
+# ── Message Center ──
+# A server-side mirror of every alert. The SAME content is sent to Telegram,
+# stored here for the in-app message center, and pushed to the iPhone banner —
+# so all three channels stay in sync. Persisted to the Railway volume so the
+# feed survives restarts.
+MESSAGES_FILE = os.environ.get("MESSAGES_FILE", os.path.join(DATA_DIR, "messages.json"))
+_MSG_LOCK = threading.RLock()
+
+
+def load_messages():
+    try:
+        if os.path.exists(MESSAGES_FILE):
+            with open(MESSAGES_FILE) as f:
+                return json.load(f) or []
+    except Exception as e:
+        logger.error(f"[messages] load failed: {e}")
+    return []
+
+
+def save_messages(msgs):
+    try:
+        with open(MESSAGES_FILE, "w") as f:
+            json.dump(msgs[:100], f)
+    except Exception as e:
+        logger.error(f"[messages] save failed: {e}")
+
+
+def _peer_key(peer):
+    """Group key for the Message Center: a phone's digits, or 'unknown'/'system'.
+    All blank/unknown callers collapse into one 'unknown' chat; everything sharing
+    the same digits lands in the same chat thread."""
+    if not peer:
+        return "unknown"
+    if peer == "system":
+        return "system"
+    digits = "".join(ch for ch in str(peer) if ch.isdigit())
+    return digits or "unknown"
+
+
+def notify_event(ico, title, body, tg_text=None, tg_parse="Markdown", call_id="", tag="msg", peer="", meta=None):
+    """One alert → three places, same content:
+      1. Telegram   (rich `tg_text` if given, else a plain title/body)
+      2. Dashboard message center  (persisted + broadcast live over SSE)
+      3. iPhone/PWA push banner    (fires even when the app is closed)
+    `peer` is the caller's phone (or 'system'); it groups the message into a
+    per-number chat thread in the dashboard and deep-links the push to that chat.
+    All fire-and-forget so the webhook stays fast."""
+    gevent.spawn(send_telegram_alert, tg_text or f"*{title}*\n{body}", tg_parse)
+    pkey = _peer_key(peer)
+    item = {
+        "id": uuid.uuid4().hex,
+        "ico": ico,
+        "title": title,
+        "body": body,
+        "ts": int(datetime.now(LOCAL_TZ).timestamp() * 1000),
+        "call_id": call_id,
+        "peer": peer,
+        "peer_key": pkey,
+        "meta": meta or {},
+    }
+    try:
+        with _MSG_LOCK:
+            msgs = load_messages()
+            msgs.insert(0, item)
+            save_messages(msgs)
+    except Exception as e:
+        logger.error(f"[messages] record failed: {e}")
+    broadcast_event("message", item)
+    gevent.spawn(send_web_push, f"{ico} {title}", body or title,
+                 f"/dashboard?key={DASHBOARD_PASSWORD}&chat={pkey}", tag)
+    return item
+
+
+def transfer_contact_for(role):
+    """The assigned contact dict for a role ('alfredo'|'human'|'emergency'), else None."""
+    d = load_transfer()
+    cid = d.get(f"{role}_id")
+    if not cid:
+        return None
+    for c in d.get("contacts", []):
+        if c.get("id") == cid:
+            return c
+    return None
+
+
+def transfer_number_for(role):
+    """Phone for a role ('alfredo'|'human'|'emergency') from the assigned contact, else None."""
+    c = transfer_contact_for(role)
+    return ((c.get("phone") or "").strip() or None) if c else None
+
+
+# ============================================================
 # TOOL 1: CHECK AVAILABILITY
 # ============================================================
 
 @app.route("/check-availability", methods=["POST"])
+@require_retell_signature
 def check_availability():
     """
     Check available appointment slots by looking at existing jobs
@@ -1206,8 +1658,9 @@ def check_availability():
                     h += 12
                 if ampm == 'am' and h == 12:
                     h = 0
-                # Snap to even hour (slot starts)
-                target_hour = h - (h % SLOT_DURATION_HOURS)
+                # Honor the EXACT requested hour — we book a 2-hour arrival window
+                # starting at it, so we don't snap to a fixed even-hour grid.
+                target_hour = h
 
     try:
         now_local = datetime.now(LOCAL_TZ)
@@ -1237,12 +1690,15 @@ def check_availability():
                 current += timedelta(days=1)
                 continue
 
-            for hour in range(BUSINESS_HOURS_START, BUSINESS_HOURS_END, SLOT_DURATION_HOURS):
-                if current.date() == now_local.date() and hour <= now_local.hour:
+            # When the caller named a specific time, check THAT exact hour (e.g. 17:00);
+            # otherwise scan the standard even-hour windows.
+            hours_to_try = [target_hour] if target_hour is not None else list(range(BUSINESS_HOURS_START, BUSINESS_HOURS_END, SLOT_DURATION_HOURS))
+            for hour in hours_to_try:
+                # A 2-hour window must fit inside business hours (6 AM–10 PM).
+                if hour < BUSINESS_HOURS_START or hour + SLOT_DURATION_HOURS > BUSINESS_HOURS_END:
                     continue
-
-                # If a specific time was requested, only consider matching hours
-                if target_hour is not None and hour != target_hour:
+                # Enforce the minimum booking lead time (no non-emergency slots < MIN_BOOKING_LEAD_HOURS out).
+                if current.replace(hour=hour, minute=0, second=0, microsecond=0) < now_local + timedelta(hours=MIN_BOOKING_LEAD_HOURS):
                     continue
 
                 # Check if at least one tech is free for this entire slot
@@ -1272,9 +1728,9 @@ def check_availability():
                 "result": "It looks like our schedule is quite full in the next few days. Let me have our scheduling team call you back to find the best time. Can I confirm your phone number?"
             })
 
-        # Return up to 6 slots — for time-specific queries, this is "the next 6 days at that time"
-        # For date-specific queries, this is "the available windows for that day"
-        slots_to_return = available_slots[:6]
+        # Keep it short — the agent offers ONE window at a time. When the caller
+        # named a time we return that time (+1 fallback day); otherwise a few.
+        slots_to_return = available_slots[:2] if target_hour is not None else available_slots[:3]
         slot_text = "\n".join([f"- {s['display']}" for s in slots_to_return])
         return jsonify({
             "result": json.dumps({
@@ -1283,7 +1739,10 @@ def check_availability():
             })
         })
 
-    except requests.HTTPError:
+    except (requests.RequestException, ValueError, KeyError) as e:
+        # Includes timeouts/connection errors (not just HTTPError) so a slow HCP
+        # degrades to a graceful callback line instead of 500-ing mid-call.
+        logger.error(f"[check-availability] failed: {e}")
         return jsonify({
             "result": "I'm having trouble checking the schedule right now. Let me take your information and have our team call you back to confirm a time."
         })
@@ -1294,6 +1753,7 @@ def check_availability():
 # ============================================================
 
 @app.route("/create-appointment", methods=["POST"])
+@require_retell_signature
 def create_appointment():
     """
     Create a job/appointment in Housecall Pro.
@@ -1360,16 +1820,49 @@ def create_appointment():
         }
         zip_code = city_zip_map.get((city or "").lower().strip(), "")
 
-    # ── Validation ──
-    # Need name and at least one contact method (phone OR email)
+    # ── Validation ── (name + phone + email all required)
     if not first_name or not last_name:
         return jsonify({
             "result": "I need the customer's first and last name to continue. Could you provide those?"
         })
-    if not phone and not email:
+    if not phone:
         return jsonify({
-            "result": "I need either a phone number or an email address to continue. Could you provide one?"
+            "result": "I still need a phone number — is the number you're calling from okay to use, or is there a better one?"
         })
+
+    # Look up the caller's existing profile once — reused for the email check,
+    # the confirmation gate, and the find-or-create below.
+    existing = hcp_find_customer_by_phone(phone) if phone else None
+
+    # Email is required for our records — but a returning caller who already has
+    # one on file doesn't need to give it again. (We do NOT email confirmations.)
+    if not email and not (existing and existing["has_email"]):
+        return jsonify({
+            "result": "I also need an email for our records — what's the best email for you?"
+        })
+
+    # Honor the caller's requested START time, but always store a 2-hour arrival
+    # window from it in Housecall Pro (e.g. caller asks "5 to 6" → we book 5–7).
+    # We never tell the caller about the 2-hour policy.
+    if start_time:
+        try:
+            end_time = (datetime.strptime(start_time, "%H:%M") + timedelta(hours=SLOT_DURATION_HOURS)).strftime("%H:%M")
+        except ValueError:
+            pass
+
+    # ── Minimum lead time for non-emergency bookings ──
+    if not is_emergency and date and start_time:
+        try:
+            req_start = datetime.strptime(f"{date}T{start_time}:00", "%Y-%m-%dT%H:%M:%S").replace(tzinfo=LOCAL_TZ)
+            if req_start < datetime.now(LOCAL_TZ) + timedelta(hours=MIN_BOOKING_LEAD_HOURS):
+                return jsonify({"result": json.dumps({
+                    "success": False,
+                    "too_soon": True,
+                    "message": f"For non-emergency visits the soonest we can schedule is about {MIN_BOOKING_LEAD_HOURS} hours out. "
+                               f"Could we pick a later window? What day works best for you?",
+                })})
+        except ValueError:
+            pass
 
     # ── Check slot availability before doing anything ──
     assigned_tech = None
@@ -1391,7 +1884,7 @@ def create_appointment():
                 while days_checked < DAYS_AHEAD_TO_CHECK and len(alt_slots) < 3:
                     if check_date.date() >= now_local.date():
                         for h in range(BUSINESS_HOURS_START, BUSINESS_HOURS_END, SLOT_DURATION_HOURS):
-                            if check_date.date() == now_local.date() and h <= now_local.hour:
+                            if check_date.replace(hour=h, minute=0, second=0, microsecond=0) < now_local + timedelta(hours=MIN_BOOKING_LEAD_HOURS):
                                 continue
                             tech = find_available_tech(busy_by_tech, check_date.date(), h, SLOT_DURATION_HOURS)
                             if tech:
@@ -1500,8 +1993,7 @@ def create_appointment():
 
     # ── Find-or-create the customer in Housecall Pro ──
     # A returning caller is reused (dedupe) instead of spawning a new record
-    # every call.
-    existing = hcp_find_customer_by_phone(phone) if phone else None
+    # every call. `existing` was looked up above (during validation).
 
     # ── HARD GATE: never book under a found profile without explicit caller
     #    confirmation. The agent must pass profile_confirmed=true, which the
@@ -1721,6 +2213,7 @@ def create_appointment():
 # ============================================================
 
 @app.route("/transfer-emergency", methods=["POST"])
+@require_retell_signature
 def transfer_emergency():
     """
     Captures customer info and returns the emergency tech's phone number
@@ -1740,62 +2233,111 @@ def transfer_emergency():
     state = args.get("state", "")
     zip_code = args.get("zip_code", "")
     notes = args.get("notes", "")
+    # Caller explicitly agreed to the $120 emergency fee — set by the agent ONLY
+    # after a clear "yes." Gates the dispatch so we never bridge (and bill) an
+    # emergency visit the customer didn't approve.
+    fee_acknowledged = bool(args.get("fee_acknowledged", False))
 
-    # Create the customer in HCP so there's a record
+    # ── HARD GATE: never dispatch the on-call tech without the $120 fee agreed.
+    #    Mirrors the create_appointment profile gate — prompt instructions alone
+    #    were skippable under pressure (a haggling caller). No transfer, no HCP
+    #    record, no alert until fee_acknowledged is true.
+    if not fee_acknowledged:
+        return jsonify({"result": json.dumps({
+            "needs_fee_acknowledgment": True,
+            "say_to_caller": "Before I connect you — there's a $120 emergency service fee for the after-hours visit. Is that okay to go ahead with?",
+            "message": "Do NOT transfer yet. State the $120 fee and get an explicit yes, then call transfer_emergency again with fee_acknowledged: true. (Human/non-emergency transfers use transfer_to_human instead — no fee.)",
+        })})
+
+    # Resolve the emergency transfer destination — dashboard-managed (the
+    # 'emergency' contact), falling back to the hardcoded on-call tech. The SAME
+    # name/number is used for the actual transfer AND the Telegram alert, so they
+    # can never drift when the destination is switched in the dashboard.
+    ec = transfer_contact_for("emergency")
+    dest_name = (ec.get("name") if ec else "") or EMERGENCY_TECH_NAME
+    dest_phone = (ec.get("phone") if ec else "") or EMERGENCY_TECH_PHONE
+
+    # Add the contact to HCP so the tech has a record. Dedupe by phone (reuse an
+    # existing customer rather than spawning a duplicate). Best-effort only — a
+    # caller who DECLINES to give info (phone-only) must still transfer, so we
+    # never block the transfer on HCP.
+    customer_id = ""
     try:
-        customer_data = {
-            "first_name": first_name,
-            "last_name": last_name,
-            "notifications_enabled": True,
-        }
-        if phone:
-            customer_data["mobile_number"] = phone
-        if email:
-            customer_data["email"] = email
+        existing = hcp_find_customer_by_phone(phone) if phone else None
+        if existing:
+            customer_id = existing["customer_id"]
+            if email and not existing["has_email"]:
+                try:
+                    requests.patch(f"{HCP_BASE_URL}/customers/{customer_id}",
+                                   headers=hcp_headers(), json={"email": email}, timeout=HCP_TIMEOUT).raise_for_status()
+                except Exception:
+                    pass
+            if street and not existing["address_id"]:
+                requests.post(f"{HCP_BASE_URL}/customers/{customer_id}/addresses",
+                              headers=hcp_headers(),
+                              json={"street": street, "city": city, "state": state, "zip": zip_code, "type": "service", "country": "US"},
+                              timeout=HCP_TIMEOUT)
+        elif first_name or last_name or phone:
+            customer_data = {"first_name": first_name, "last_name": last_name, "notifications_enabled": True}
+            if phone:
+                customer_data["mobile_number"] = phone
+            if email:
+                customer_data["email"] = email
+            cust_resp = hcp_post("/customers", customer_data)
+            customer_id = cust_resp.get("id", "")
+            if street:
+                requests.post(f"{HCP_BASE_URL}/customers/{customer_id}/addresses",
+                              headers=hcp_headers(),
+                              json={"street": street, "city": city, "state": state, "zip": zip_code, "type": "service", "country": "US"},
+                              timeout=HCP_TIMEOUT)
 
-        cust_resp = hcp_post("/customers", customer_data)
-        customer_id = cust_resp.get("id", "")
-
-        if street:
-            addr_data = {
-                "street": street,
-                "city": city,
-                "state": state,
-                "zip": zip_code,
-                "type": "service",
-                    "country": "US",
+        if customer_id:
+            lead_data = {
+                "customer_id": customer_id,
+                "notes": f"EMERGENCY CALL — {EMERGENCY_FEE} fee acknowledged. "
+                         f"Transferred to {dest_name} at {dest_phone}. "
+                         f"Booked via AI phone agent. "
+                         f"Customer: {first_name} {last_name}, Phone: {phone}. "
+                         f"Address: {street}, {city}, {state} {zip_code}. "
+                         f"Problem: {notes}".strip(),
             }
-            requests.post(
-                f"{HCP_BASE_URL}/customers/{customer_id}/addresses",
-                headers=hcp_headers(),
-                json=addr_data,
-            )
-
-        # Create an emergency lead/note
-        lead_data = {
-            "customer_id": customer_id,
-            "notes": f"EMERGENCY CALL — {EMERGENCY_FEE} fee acknowledged. "
-                     f"Transferred to {EMERGENCY_TECH_NAME} at {EMERGENCY_TECH_PHONE}. "
-                     f"Booked via AI phone agent. "
-                     f"Customer: {first_name} {last_name}, Phone: {phone}. "
-                     f"Address: {street}, {city}, {state} {zip_code}. "
-                     f"Problem: {notes}".strip(),
-        }
-        try:
-            hcp_post("/leads", lead_data)
-        except requests.HTTPError:
-            pass
-
+            try:
+                hcp_post("/leads", lead_data)
+            except requests.HTTPError:
+                pass
     except requests.HTTPError:
         pass  # Even if HCP fails, we still transfer the call
+
+    # Telegram alert — give the on-call tech context before the call lands. Shows
+    # whatever was actually collected (blanks if the caller declined) and the
+    # real number we're dialing.
+    cust_name = f"{first_name} {last_name}".strip() or "(not provided)"
+    address_line = ", ".join(p for p in [street, city, state, zip_code] if p) or "(not provided)"
+    tg_msg = (
+        f"🚨 *Emergency transfer*\n"
+        f"Customer: *{cust_name}*\n"
+        f"Phone: `{phone or 'unknown'}`\n"
+        f"Email: {email or '(not provided)'}\n"
+        f"Address: {address_line}\n"
+        f"Problem: {notes or '(no notes captured)'}\n"
+        f"Fee acknowledged: {EMERGENCY_FEE}\n"
+        f"Transferring to: {dest_name} ({dest_phone})"
+    )
+    notify_event("🚨", "Emergency transfer",
+                 f"{cust_name} · {phone or 'unknown'} → {dest_name}"
+                 + (f" · {notes}" if notes else ""),
+                 tg_msg, "Markdown", "", "emergency", peer=phone,
+                 meta={"kind": "emergency", "name": cust_name, "phone": phone,
+                       "address": address_line, "problem": notes, "fee": EMERGENCY_FEE,
+                       "dest_name": dest_name, "dest_phone": dest_phone})
 
     return jsonify({
         "result": json.dumps({
             "success": True,
-            "transfer_to": EMERGENCY_TECH_PHONE,
-            "tech_name": EMERGENCY_TECH_NAME,
-            "message": f"Transferring to {EMERGENCY_TECH_NAME} now. "
-                       f"Customer {first_name} {last_name} has an emergency and agreed to the {EMERGENCY_FEE} fee.",
+            "transfer_to": dest_phone,
+            "tech_name": dest_name,
+            "message": f"Transferring to {dest_name} now. "
+                       f"Customer {cust_name} has an emergency and agreed to the {EMERGENCY_FEE} fee.",
         })
     })
 
@@ -1891,14 +2433,16 @@ def _clean_summary(text):
     return first[:160]
 
 
-def _inbound_empty_response():
-    return jsonify({"call_inbound": {"dynamic_variables": {
-        "returning_caller": "false",
-        "caller_first_name": "",
-        "last_call_summary": "",
-        "last_call_outcome": "",
-        **_customer_dynamic_vars(None),
-    }}})
+def _inbound_base_vars(from_number=""):
+    """Variables every inbound call needs regardless of caller history:
+    the caller's own number (to confirm as the contact number) and the
+    transfer destinations (so the transfer tools resolve)."""
+    return {
+        "caller_phone": from_number or "",
+        # Dashboard-assigned contact wins; env var is the fallback.
+        "alfredo_transfer_number": transfer_number_for("alfredo") or ALFREDO_TRANSFER_PHONE,
+        "human_transfer_number": transfer_number_for("human") or HUMAN_TRANSFER_PHONE,
+    }
 
 
 def _customer_dynamic_vars(cust):
@@ -1947,7 +2491,20 @@ def _lookup_last_retell_call(from_number):
     return None
 
 
+def _inbound_empty_response(from_number=""):
+    v = _inbound_base_vars(from_number)
+    v.update({
+        "returning_caller": "false",
+        "caller_first_name": "",
+        "last_call_summary": "",
+        "last_call_outcome": "",
+    })
+    v.update(_customer_dynamic_vars(None))
+    return jsonify({"call_inbound": {"dynamic_variables": v}})
+
+
 @app.route("/retell/inbound", methods=["POST"])
+@require_retell_signature
 def retell_inbound():
     """
     Called by Retell BEFORE the call connects.
@@ -1966,7 +2523,7 @@ def retell_inbound():
     logger.info(f"[inbound] from={from_number}")
 
     if os.environ.get("INBOUND_CONTEXT_ENABLED", "true").lower() != "true":
-        return _inbound_empty_response()
+        return _inbound_empty_response(from_number)
 
     skip = {n.strip() for n in os.environ.get("INBOUND_CONTEXT_SKIP_NUMBERS", "").split(",") if n.strip()}
     # Skip-listed numbers suppress only the "welcome back" call-history recap
@@ -1977,7 +2534,7 @@ def retell_inbound():
         logger.info(f"[inbound] skip call-history greeting for {from_number}")
 
     if not from_number:
-        return _inbound_empty_response()
+        return _inbound_empty_response(from_number)
 
     # Run the two slow lookups concurrently to stay under Retell's ~3s budget:
     #   - past Retell calls (for the greeting recap)
@@ -2012,16 +2569,19 @@ def retell_inbound():
         custom = analysis.get("custom_analysis_data") or {}
         outcome = (custom.get("outcome") or "").strip()
 
-    return jsonify({"call_inbound": {"dynamic_variables": {
+    v = _inbound_base_vars(from_number)
+    v.update({
         "returning_caller": "true" if summary else "false",
         "caller_first_name": "",
         "last_call_summary": summary,
         "last_call_outcome": outcome,
-        **_customer_dynamic_vars(cust),
-    }}})
+    })
+    v.update(_customer_dynamic_vars(cust))
+    return jsonify({"call_inbound": {"dynamic_variables": v}})
 
 
 @app.route("/webhook/retell", methods=["POST"])
+@require_retell_signature
 def retell_webhook():
     """Receive Retell call lifecycle webhooks."""
     body = request.json or {}
@@ -2046,11 +2606,23 @@ def retell_webhook():
         db_upsert_call(ACTIVE_CALLS[call_id])
         broadcast_event("call_started", ACTIVE_CALLS[call_id])
 
-        # SMS alert (fire-and-forget greenlet so the webhook stays fast)
+        # Telegram alert (fire-and-forget greenlet so the webhook stays fast)
         caller = call.get("from_number", "unknown")
         dash_url = f"{DASHBOARD_PUBLIC_URL}/dashboard?key={DASHBOARD_PASSWORD}"
-        msg = f"Call from {caller} — High Tech AC AI handling. Listen live: {dash_url}"
-        gevent.spawn(send_sms_alert, msg)
+        started_local = datetime.now(LOCAL_TZ).strftime("%-I:%M %p %Z")
+        tg_msg = (
+            f"📞 *Incoming call*\n"
+            f"From: `{caller}`\n"
+            f"Time: {started_local}\n"
+            f"[Listen live]({dash_url})"
+        )
+        # Telegram + message center + iPhone push, one call, same content
+        body = (f"From {caller}" if caller and caller != "unknown"
+                else "A customer is calling now")
+        notify_event("📞", "Incoming call", f"{body} · {started_local}",
+                     tg_msg, "Markdown", call_id, "call-" + call_id, peer=caller,
+                     meta={"kind": "incoming", "phone": caller, "time": started_local,
+                           "call_id": call_id})
 
         # Start polling for live transcript
         if call_id not in POLL_GREENLETS:
@@ -2099,6 +2671,16 @@ def retell_webhook():
                     logger.info(f"[analysis] {call_id[:20]} outcome={analysis.get('custom_analysis_data',{}).get('outcome')}")
                     db_upsert_call(ACTIVE_CALLS[call_id])
                     broadcast_event("call_analyzed", ACTIVE_CALLS[call_id])
+
+                    # Wrap-up to all three channels: who called, what happened,
+                    # status, follow-up. Telegram gets the rich version; the
+                    # message center + iPhone push get the plain mirror.
+                    ico, title, body = _format_call_ended_plain(ACTIVE_CALLS[call_id])
+                    notify_event(ico, title, body,
+                                 _format_call_ended_alert(ACTIVE_CALLS[call_id]), "HTML",
+                                 call_id, "ended-" + call_id,
+                                 peer=ACTIVE_CALLS[call_id].get("from_number", ""),
+                                 meta=_call_meta(ACTIVE_CALLS[call_id]))
             except Exception as e:
                 logger.error(f"[analysis] fetch failed: {e}")
 
@@ -2141,7 +2723,9 @@ def retell_webhook():
 
 @app.route("/api/active-calls", methods=["GET"])
 def list_active_calls():
-    """Return all known calls (active + recent)."""
+    """Return all known calls (active + recent). Key-gated — exposes customer PII."""
+    if not _require_key():
+        return jsonify({"error": "unauthorized"}), 401
     return jsonify(list(ACTIVE_CALLS.values()))
 
 
@@ -2152,12 +2736,16 @@ def list_active_calls():
 @app.route("/api/techs", methods=["GET"])
 def list_techs():
     """Return all field techs from FIELD_TECHS config."""
+    if not _require_key():
+        return jsonify({"error": "unauthorized"}), 401
     return jsonify(FIELD_TECHS)
 
 
 @app.route("/api/oncall", methods=["GET"])
 def get_oncall():
     """Get the full per-date on-call schedule + helpers for the dashboard."""
+    if not _require_key():
+        return jsonify({"error": "unauthorized"}), 401
     schedule = load_oncall()
     today = datetime.now(LOCAL_TZ)
     return jsonify({
@@ -2213,9 +2801,84 @@ def delete_oncall(date_key):
     return jsonify({"ok": True})
 
 
+# ---- Transfer contacts (dashboard-managed transfer numbers) ----
+def _require_key():
+    key = (request.json or {}).get("key", "") if request.is_json else ""
+    key = key or request.args.get("key", "")
+    return key == DASHBOARD_PASSWORD
+
+
+@app.route("/api/transfer-contacts", methods=["GET"])
+def get_transfer_contacts():
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    d = load_transfer()
+    return jsonify({
+        "contacts": d.get("contacts", []),
+        "alfredo_id": d.get("alfredo_id"),
+        "human_id": d.get("human_id"),
+        "emergency_id": d.get("emergency_id"),
+        "env_fallback": {"alfredo": ALFREDO_TRANSFER_PHONE, "human": HUMAN_TRANSFER_PHONE, "emergency": EMERGENCY_TECH_PHONE},
+    })
+
+
+@app.route("/api/transfer-contacts", methods=["POST"])
+def add_transfer_contact():
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.json or {}
+    name = (body.get("name") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    if not name or not phone:
+        return jsonify({"ok": False, "error": "name and phone required"}), 400
+    d = load_transfer()
+    cid = uuid.uuid4().hex[:8]
+    d["contacts"].append({"id": cid, "name": name, "phone": phone})
+    ok = save_transfer(d)
+    broadcast_event("transfer_updated", {"contacts": d["contacts"]})
+    return jsonify({"ok": ok, "id": cid, "contacts": d["contacts"]})
+
+
+@app.route("/api/transfer-contacts/<cid>", methods=["DELETE"])
+def delete_transfer_contact(cid):
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    d = load_transfer()
+    d["contacts"] = [c for c in d.get("contacts", []) if c.get("id") != cid]
+    if d.get("alfredo_id") == cid:
+        d["alfredo_id"] = None
+    if d.get("human_id") == cid:
+        d["human_id"] = None
+    if d.get("emergency_id") == cid:
+        d["emergency_id"] = None
+    ok = save_transfer(d)
+    broadcast_event("transfer_updated", {"contacts": d["contacts"]})
+    return jsonify({"ok": ok, "alfredo_id": d["alfredo_id"], "human_id": d["human_id"], "emergency_id": d["emergency_id"]})
+
+
+@app.route("/api/transfer-contacts/assign", methods=["POST"])
+def assign_transfer_contact():
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    body = request.json or {}
+    role = body.get("role")
+    cid = body.get("id")  # may be null to clear the role
+    if role not in ("alfredo", "human", "emergency"):
+        return jsonify({"ok": False, "error": "role must be alfredo, human, or emergency"}), 400
+    d = load_transfer()
+    if cid is not None and not any(c.get("id") == cid for c in d.get("contacts", [])):
+        return jsonify({"ok": False, "error": "unknown contact"}), 400
+    d[f"{role}_id"] = cid
+    ok = save_transfer(d)
+    broadcast_event("transfer_updated", {"alfredo_id": d["alfredo_id"], "human_id": d["human_id"], "emergency_id": d["emergency_id"]})
+    return jsonify({"ok": ok, "alfredo_id": d["alfredo_id"], "human_id": d["human_id"], "emergency_id": d["emergency_id"]})
+
+
 @app.route("/api/how-found-stats", methods=["GET"])
 def how_found_stats():
     """Aggregate 'how_found' answers across all calls for the dashboard chart."""
+    if not _require_key():
+        return jsonify({"error": "unauthorized"}), 401
     counts = {}
     total = 0
     for c in ACTIVE_CALLS.values():
@@ -2251,12 +2914,15 @@ def reset_dashboard():
 
 @app.route("/api/end-call/<call_id>", methods=["POST"])
 def force_end_call(call_id):
-    """End an active Retell call via the Retell API."""
+    """End an active Retell call via the Retell API. Key-gated."""
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
     try:
         # Retell uses POST /v2/stop-call/{call_id}
         resp = requests.post(
             f"https://api.retellai.com/v2/stop-call/{call_id}",
             headers={"Authorization": f"Bearer {RETELL_API_KEY}"},
+            timeout=8,
         )
         ok = resp.status_code in (200, 204)
         return jsonify({
@@ -2270,7 +2936,9 @@ def force_end_call(call_id):
 
 @app.route("/stream", methods=["GET"])
 def stream():
-    """Server-Sent Events stream for the dashboard."""
+    """Server-Sent Events stream for the dashboard. Key-gated via ?key= (EventSource can't send headers)."""
+    if request.args.get("key", "") != DASHBOARD_PASSWORD:
+        return Response("unauthorized", status=401)
     def event_stream():
         q = queue.Queue(maxsize=200)
         SUBSCRIBERS.append(q)
@@ -2303,66 +2971,125 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>High Tech Air Conditioning — Call Intelligence</title>
 <link rel="icon" href="{{ logo_data_uri }}">
+<!-- PWA / Add to Home Screen -->
+<meta name="theme-color" content="#05070B">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="High Tech AC">
+<link rel="apple-touch-icon" href="/app-icon-192.png">
+<link rel="manifest" href="/manifest.webmanifest?key={{ dashboard_key }}">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    /* HighTech brand palette — sourced from hightechacfl.com */
-    --brand-red: #C4080C;
-    --brand-red-warm: #DF3131;
-    --brand-red-soft: rgba(196, 8, 12, 0.08);
-    --brand-blue: #0D597B;
-    --brand-blue-light: #1386B9;
-    --brand-blue-soft: rgba(13, 89, 123, 0.07);
-    --brand-cream: #F5EEE4;
+    /* === Futuristic dark theme — near-black with cyan accents === */
+    /* Cyan accent system (primary) */
+    --cyan: #22D3EE;
+    --cyan-bright: #67E8F9;
+    --cyan-dim: #0E7490;
+    --cyan-soft: rgba(34, 211, 238, 0.12);
+    --cyan-glow: rgba(34, 211, 238, 0.55);
 
-    /* Surfaces (light, calm, premium) */
-    --bg: #FAFAF6;
-    --surface: #FFFFFF;
-    --surface-soft: #F4F1EA;
-    --hairline: rgba(15, 23, 42, 0.07);
-    --hairline-strong: rgba(15, 23, 42, 0.12);
+    /* The old theme used --brand-red as its PRIMARY accent everywhere, so we point
+       it at cyan to re-skin the whole UI. True alerts use --danger (a real red) below. */
+    --brand-red: var(--cyan);
+    --brand-red-warm: var(--cyan-bright);
+    --brand-red-soft: var(--cyan-soft);
+    --brand-blue: var(--cyan);
+    --brand-blue-light: var(--cyan-bright);
+    --brand-blue-soft: var(--cyan-soft);
+    --brand-cream: #0E1620;
 
-    /* Ink (no pure black per taste rules) */
-    --ink: #15171C;
-    --ink-soft: #3B3A3A;
-    --ink-muted: #6B7280;
-    --ink-dim: #9CA3AF;
+    /* Surfaces (deep space black, layered) */
+    --bg: #05070B;
+    --surface: #0C121B;
+    --surface-soft: #121C28;
+    --hairline: rgba(34, 211, 238, 0.12);
+    --hairline-strong: rgba(34, 211, 238, 0.26);
 
-    /* Functional states — desaturated, brand-tinted */
-    --warning: #B7791F;
-    --warning-soft: rgba(183, 121, 31, 0.12);
-    --success: #047857;
-    --success-soft: rgba(4, 120, 87, 0.10);
-    --danger: var(--brand-red);
-    --danger-soft: var(--brand-red-soft);
-    --info: var(--brand-blue);
-    --info-soft: var(--brand-blue-soft);
+    /* Ink (cool near-white → muted cyan-gray) */
+    --ink: #E8F4F8;
+    --ink-soft: #B6C8D2;
+    --ink-muted: #7C93A0;
+    --ink-dim: #51697A;
 
-    /* Elevation */
-    --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 12px 32px -16px rgba(15, 23, 42, 0.10);
-    --shadow-card-hover: 0 1px 2px rgba(15, 23, 42, 0.05), 0 24px 48px -20px rgba(15, 23, 42, 0.16);
-    --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+    /* Functional states — luminous on black */
+    --warning: #FBBF24;
+    --warning-soft: rgba(251, 191, 36, 0.14);
+    --success: #34F5C5;
+    --success-soft: rgba(52, 245, 197, 0.13);
+    --danger: #FF5063;
+    --danger-soft: rgba(255, 80, 99, 0.15);
+    --info: var(--cyan);
+    --info-soft: var(--cyan-soft);
+
+    /* Elevation — depth + cyan glow instead of soft drop shadows */
+    --shadow-card: 0 1px 0 rgba(255,255,255,0.03) inset, 0 20px 44px -28px rgba(0,0,0,0.9);
+    --shadow-card-hover: 0 0 0 1px var(--hairline-strong), 0 24px 60px -26px rgba(34,211,238,0.22);
+    --shadow-inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.05);
 
     /* Motion */
     --ease: cubic-bezier(0.16, 1, 0.3, 1);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
+  html { overflow-x: hidden; }
   body {
     font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     background: var(--bg);
     background-image:
-      radial-gradient(1200px 600px at -10% -20%, rgba(196, 8, 12, 0.045), transparent 60%),
-      radial-gradient(1100px 700px at 110% 10%, rgba(13, 89, 123, 0.05), transparent 55%);
+      radial-gradient(900px 520px at 8% -10%, rgba(34, 211, 238, 0.10), transparent 60%),
+      radial-gradient(1000px 640px at 108% 4%, rgba(34, 211, 238, 0.06), transparent 55%),
+      linear-gradient(rgba(34,211,238,0.022) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(34,211,238,0.022) 1px, transparent 1px);
+    background-size: auto, auto, 44px 44px, 44px 44px;
+    background-attachment: fixed;
     color: var(--ink);
     font-size: 14px;
     line-height: 1.55;
+    overflow-x: hidden;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
   }
-  ::selection { background: var(--brand-red-soft); color: var(--brand-red); }
+  /* ---- Futuristic animated backdrop (GPU-cheap: blurred drifting aurora + slow scan sweep) ---- */
+  body::before {
+    content: ''; position: fixed; inset: -25%; z-index: -2; pointer-events: none;
+    background:
+      radial-gradient(38% 38% at 18% 28%, rgba(34,211,238,0.13), transparent 70%),
+      radial-gradient(32% 32% at 82% 18%, rgba(34,211,238,0.10), transparent 70%),
+      radial-gradient(44% 44% at 62% 88%, rgba(96,131,255,0.09), transparent 70%),
+      radial-gradient(30% 30% at 40% 65%, rgba(34,211,238,0.07), transparent 70%);
+    filter: blur(46px) saturate(1.1);
+    animation: auroraDrift 26s ease-in-out infinite alternate;
+    will-change: transform;
+  }
+  body::after {
+    content: ''; position: fixed; left: 0; right: 0; top: 0; height: 42vh; z-index: -1; pointer-events: none;
+    background: linear-gradient(180deg, rgba(34,211,238,0.06), transparent);
+    animation: scanSweep 9s linear infinite;
+    will-change: transform, opacity;
+  }
+  @keyframes auroraDrift {
+    0%   { transform: translate3d(0,0,0) scale(1); }
+    50%  { transform: translate3d(3%,-2%,0) scale(1.08); }
+    100% { transform: translate3d(-2%,3%,0) scale(1.05); }
+  }
+  @keyframes scanSweep {
+    0%   { transform: translateY(-42vh); opacity: 0; }
+    12%  { opacity: 0.5; }
+    50%  { opacity: 0.18; }
+    100% { transform: translateY(142vh); opacity: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    body::before, body::after { animation: none; }
+  }
+  ::selection { background: var(--cyan-soft); color: var(--cyan-bright); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(34,211,238,0.22); border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(34,211,238,0.4); background-clip: content-box; }
 
   /* Inline icon helper */
   .icon { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 1.6; }
@@ -2374,10 +3101,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
   /* HEADER */
   header {
-    background: rgba(255, 255, 255, 0.85);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
+    background: linear-gradient(180deg, rgba(12,18,27,0.92), rgba(8,12,18,0.72));
+    backdrop-filter: blur(16px) saturate(1.2);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
     border-bottom: 1px solid var(--hairline);
+    box-shadow: 0 1px 0 rgba(34,211,238,0.10), 0 16px 40px -28px rgba(0,0,0,0.9);
     padding: 16px 32px;
     display: flex;
     align-items: center;
@@ -2389,7 +3117,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .brand { display: flex; align-items: center; gap: 16px; }
   .brand-mark {
     height: 44px; width: auto; display: block;
-    filter: drop-shadow(0 2px 6px rgba(196, 8, 12, 0.08));
+    filter: drop-shadow(0 2px 10px rgba(34, 211, 238, 0.30));
     transition: transform 0.4s var(--ease);
   }
   .brand:hover .brand-mark { transform: translateY(-1px) rotate(-0.5deg); }
@@ -2588,9 +3316,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     background: var(--surface-soft);
     border-color: var(--hairline-strong);
   }
-  .call-item.selected::before { background: var(--brand-blue); }
   .call-item.live::before { background: var(--success); }
-  .call-item.live.selected::before { background: var(--success); }
   .call-item-header {
     display: flex; align-items: center; justify-content: space-between;
     margin-bottom: 8px;
@@ -2632,17 +3358,160 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     border-color: rgba(4, 120, 87, 0.18);
   }
   .badge-danger {
-    background: var(--brand-red-soft); color: var(--brand-red);
-    border-color: rgba(196, 8, 12, 0.18);
+    background: var(--danger-soft); color: var(--danger);
+    border-color: rgba(255, 80, 99, 0.30);
   }
+  /* ---- Priority-coded status badges (match the header legend) ---- */
+  .badge-p-high      { background: var(--danger-soft);  color: var(--danger);      border-color: rgba(255, 80, 99, 0.32); }
+  .badge-p-attention { background: var(--warning-soft); color: var(--warning);     border-color: rgba(251, 191, 36, 0.34); }
+  .badge-p-good      { background: var(--success-soft); color: var(--success);     border-color: rgba(52, 245, 197, 0.30); }
+  .badge-p-check     { background: var(--cyan-soft);    color: var(--cyan-bright); border-color: rgba(34, 211, 238, 0.34); }
+  /* Left-accent bar on each call row reflects its priority tier */
+  .call-item.tier-high::before      { background: var(--danger); }
+  .call-item.tier-attention::before { background: var(--warning); }
+  .call-item.tier-good::before      { background: var(--success); }
+  .call-item.tier-check::before     { background: var(--cyan); }
+  .call-item.tier-live::before      { background: var(--success); }
+  /* Header priority legend */
+  .legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .legend .lg { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--ink-soft); white-space: nowrap; }
+  .legend .lg-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; box-shadow: 0 0 7px currentColor; }
+  .lg-high { background: var(--danger); color: var(--danger); }
+  .lg-attention { background: var(--warning); color: var(--warning); }
+  .lg-good { background: var(--success); color: var(--success); }
+  .lg-check { background: var(--cyan); color: var(--cyan); }
+  /* Notifications bell + feed */
+  .notif-bell { position: relative; }
+  .notif-badge {
+    position: absolute; top: -5px; right: -5px; min-width: 16px; height: 16px; padding: 0 4px;
+    border-radius: 8px; background: var(--danger); color: #fff; font-size: 9px; font-weight: 800;
+    display: none; align-items: center; justify-content: center; line-height: 1; box-shadow: 0 0 8px var(--danger);
+  }
+  .notif-badge.show { display: inline-flex; }
+  .notif-list { display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto; }
+  .notif-item { display: flex; gap: 12px; padding: 12px 14px; border-radius: 12px;
+    background: var(--surface); border: 1px solid var(--hairline); }
+  .notif-item.unread { border-color: var(--hairline-strong); background: var(--surface-soft); }
+  .notif-ico { font-size: 18px; line-height: 1.4; flex-shrink: 0; }
+  .notif-body { flex: 1; min-width: 0; }
+  .notif-title { font-size: 13px; font-weight: 600; color: var(--ink); }
+  .notif-sub { font-size: 12px; color: var(--ink-muted); margin-top: 2px; }
+  .notif-time { font-size: 11px; color: var(--ink-dim); margin-top: 3px; }
+  .notif-empty { padding: 28px; text-align: center; color: var(--ink-muted); font-size: 13px; }
+  /* ---- Message Center: WhatsApp-style chats grouped by phone number ---- */
+  #notif-modal .oncall-card { max-width: 460px; width: 100%; display: flex; flex-direction: column; }
+  #chat-listview, #chat-threadview { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .chat-list { display: flex; flex-direction: column; gap: 6px; max-height: 62vh; overflow-y: auto; padding: 2px; }
+  .chat-row {
+    display: flex; gap: 12px; align-items: center; padding: 11px 12px; border-radius: 14px;
+    background: var(--surface); border: 1px solid var(--hairline); cursor: pointer;
+    transition: background 0.16s var(--ease), border-color 0.16s var(--ease), transform 0.16s var(--ease);
+  }
+  .chat-row:hover { background: var(--surface-soft); }
+  .chat-row:active { transform: scale(0.99); }
+  .chat-row.unread { border-color: var(--hairline-strong); background: var(--surface-soft); }
+  .chat-avatar {
+    width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0; font-size: 19px;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--cyan-soft); border: 1px solid var(--hairline);
+  }
+  .chat-row-body { flex: 1; min-width: 0; }
+  .chat-row-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .chat-row-name { font-size: 14px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chat-row.unread .chat-row-name { font-weight: 700; }
+  .chat-row-time { font-size: 11px; color: var(--ink-dim); flex-shrink: 0; }
+  .chat-row-bottom { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 2px; }
+  .chat-row-preview { font-size: 12px; color: var(--ink-muted); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; flex: 1; min-width: 0; }
+  .chat-row-ico { margin-right: 5px; opacity: 0.9; }
+  .chat-row.unread .chat-row-preview { color: var(--ink-soft); }
+  .chat-row-badge {
+    min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--cyan); color: #04121a;
+    font-size: 10px; font-weight: 800; display: inline-flex; align-items: center; justify-content: center;
+    flex-shrink: 0; box-shadow: 0 0 7px var(--cyan-glow);
+  }
+  .chat-thread-head { display: flex; align-items: center; gap: 10px; }
+  .chat-head-avatar { width: 34px; height: 34px; font-size: 16px; }
+  .chat-back {
+    width: 32px; height: 32px; flex-shrink: 0; border-radius: 9px; cursor: pointer;
+    background: var(--surface-soft); border: 1px solid var(--hairline); color: var(--ink);
+    font-size: 20px; line-height: 1; display: flex; align-items: center; justify-content: center;
+  }
+  .chat-back:hover { background: var(--surface); }
+  .chat-thread {
+    display: flex; flex-direction: column; gap: 8px; max-height: 60vh; overflow-y: auto;
+    padding: 10px 2px 4px;
+  }
+  .msg-bubble {
+    align-self: flex-start; max-width: 86%; padding: 9px 12px; border-radius: 4px 14px 14px 14px;
+    background: var(--surface-soft); border: 1px solid var(--hairline);
+  }
+  .msg-bubble-head { display: flex; align-items: center; gap: 6px; }
+  .msg-bubble-ico { font-size: 13px; }
+  /* The alert type is a small kicker label; the body is the real message text. */
+  .msg-bubble-title { font-size: 11px; font-weight: 700; letter-spacing: 0.02em; text-transform: uppercase; color: var(--ink-muted); }
+  .msg-bubble-body { font-size: 13.5px; color: var(--ink); margin-top: 4px; white-space: pre-wrap; line-height: 1.45; }
+  .msg-bubble-time { font-size: 10px; color: var(--ink-dim); margin-top: 4px; text-align: right; }
+  /* Day separator + conversation-start caption */
+  .msg-day { text-align: center; margin: 6px 0 2px; }
+  .msg-day span { display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em;
+    color: var(--ink-muted); background: var(--surface-soft); border: 1px solid var(--hairline);
+    border-radius: 999px; padding: 3px 10px; }
+  .msg-start { text-align: center; font-size: 10.5px; color: var(--ink-dim); padding: 2px 0 6px; }
+  /* Rich bubbles — mirror the full Telegram wrap-up + action buttons */
+  .msg-bubble.rich { max-width: 96%; width: 100%; border-radius: 14px; padding: 11px 13px; }
+  .msg-kicker { display: flex; align-items: center; gap: 6px; font-size: 10.5px; font-weight: 800;
+    letter-spacing: 0.04em; text-transform: uppercase; color: var(--cyan-bright); }
+  .msg-kicker-ico { font-size: 12px; }
+  .msg-name { font-size: 16px; font-weight: 700; color: var(--ink); margin-top: 4px; letter-spacing: -0.01em; }
+  .msg-phone { display: inline-block; font-size: 13px; font-weight: 600; color: var(--cyan-bright);
+    text-decoration: none; font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .msg-phone:active { opacity: 0.7; }
+  .msg-field { display: flex; gap: 7px; align-items: flex-start; font-size: 13px; color: var(--ink-soft);
+    margin-top: 7px; line-height: 1.42; }
+  .msg-field-ico { flex-shrink: 0; }
+  .msg-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .msg-chip { font-size: 11px; font-weight: 600; color: var(--ink-muted); background: var(--surface);
+    border: 1px solid var(--hairline); border-radius: 999px; padding: 3px 9px; }
+  .msg-followup { margin-top: 8px; font-size: 12.5px; font-weight: 600; color: var(--warning);
+    background: var(--warning-soft); border: 1px solid rgba(251, 191, 36, 0.28); border-radius: 9px; padding: 6px 10px; }
+  .msg-booking { margin-top: 8px; background: var(--surface); border: 1px solid var(--hairline);
+    border-radius: 10px; padding: 8px 11px; }
+  .msg-booking-row { font-size: 13px; color: var(--ink); }
+  .msg-booking-sub { font-size: 12px; color: var(--ink-muted); margin-top: 2px; }
+  .msg-confirm { margin-top: 9px; background: var(--cyan-soft); border: 1px solid rgba(34, 211, 238, 0.22);
+    border-radius: 10px; padding: 8px 11px; }
+  .msg-confirm-label { font-size: 10px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: var(--cyan-bright); }
+  .msg-confirm-text { font-size: 12.5px; color: var(--ink-soft); margin-top: 4px; line-height: 1.45; white-space: pre-wrap; }
+  .msg-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
+  .msg-act { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; font-weight: 600;
+    color: var(--ink); background: var(--surface); border: 1px solid var(--hairline-strong); border-radius: 10px;
+    padding: 8px 11px; min-height: 38px; cursor: pointer; text-decoration: none;
+    transition: background 0.15s var(--ease), border-color 0.15s var(--ease), transform 0.1s var(--ease); }
+  .msg-act:hover { background: var(--surface-soft); border-color: var(--cyan); }
+  .msg-act:active { transform: scale(0.98); }
+  /* Polished empty state for the inbox (native-app feel) */
+  .chat-empty {
+    flex: 1; min-height: 200px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    gap: 12px; padding: 40px 28px; color: var(--ink-muted);
+  }
+  .chat-empty .chat-empty-ico {
+    width: 56px; height: 56px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+    background: var(--cyan-soft); border: 1px solid var(--hairline);
+  }
+  .chat-empty .chat-empty-ico svg { width: 26px; height: 26px; color: var(--cyan); }
+  .chat-empty-title { font-size: 15px; font-weight: 600; color: var(--ink); }
+  .chat-empty-sub { font-size: 12.5px; color: var(--ink-muted); max-width: 260px; line-height: 1.5; }
   .live-pulse {
     width: 6px; height: 6px; border-radius: 50%; background: var(--success);
     animation: livePulse 1.5s ease-in-out infinite;
-    box-shadow: 0 0 0 0 rgba(4, 120, 87, 0.5);
+    box-shadow: 0 0 8px 1px rgba(52, 245, 197, 0.7);
   }
   @keyframes livePulse {
-    0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(4, 120, 87, 0.45); }
-    70% { transform: scale(1.1); box-shadow: 0 0 0 6px rgba(4, 120, 87, 0); }
+    0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(52, 245, 197, 0.55); }
+    70% { transform: scale(1.1); box-shadow: 0 0 0 7px rgba(52, 245, 197, 0); }
   }
   @keyframes fadeUp {
     to { opacity: 1; transform: translateY(0); }
@@ -2678,21 +3547,22 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .btn:active:not(:disabled) { transform: translateY(1px) scale(0.99); }
   .btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .btn-primary {
-    background: var(--brand-red); color: #fff;
-    box-shadow: 0 1px 0 rgba(255,255,255,0.18) inset, 0 8px 18px -8px rgba(196, 8, 12, 0.55);
+    background: linear-gradient(180deg, var(--cyan-bright), var(--cyan));
+    color: #04090E; font-weight: 600; border-color: transparent;
+    box-shadow: 0 0 0 1px rgba(34,211,238,0.5) inset, 0 8px 22px -8px var(--cyan-glow);
   }
   .btn-primary:hover:not(:disabled) {
-    background: var(--brand-red-warm);
+    background: linear-gradient(180deg, #8DEEFF, var(--cyan-bright));
     transform: translateY(-1px);
-    box-shadow: 0 1px 0 rgba(255,255,255,0.18) inset, 0 14px 28px -10px rgba(196, 8, 12, 0.65);
+    box-shadow: 0 0 0 1px rgba(34,211,238,0.6) inset, 0 16px 34px -10px var(--cyan-glow);
   }
   .btn-danger {
-    background: var(--surface); color: var(--brand-red);
-    border-color: rgba(196, 8, 12, 0.22);
+    background: var(--surface); color: var(--danger);
+    border-color: rgba(255, 80, 99, 0.30);
   }
   .btn-danger:hover:not(:disabled) {
-    background: var(--brand-red-soft);
-    border-color: rgba(196, 8, 12, 0.4);
+    background: var(--danger-soft);
+    border-color: rgba(255, 80, 99, 0.5);
   }
   .btn-secondary {
     background: var(--surface); color: var(--ink); border-color: var(--hairline);
@@ -2763,7 +3633,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     box-shadow: var(--shadow-card);
   }
   .followup-banner.success { border-left-color: var(--success); }
-  .followup-banner.danger { border-left-color: var(--brand-red); }
+  .followup-banner.danger { border-left-color: var(--danger); }
   .followup-icon {
     width: 36px; height: 36px; border-radius: 10px;
     display: inline-flex; align-items: center; justify-content: center;
@@ -2771,7 +3641,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     background: var(--warning-soft); color: var(--warning);
   }
   .followup-banner.success .followup-icon { background: var(--success-soft); color: var(--success); }
-  .followup-banner.danger .followup-icon { background: var(--brand-red-soft); color: var(--brand-red); }
+  .followup-banner.danger .followup-icon { background: var(--danger-soft); color: var(--danger); }
   .followup-text strong {
     font-size: 13.5px; font-weight: 600; display: block; margin-bottom: 2px;
     color: var(--ink); letter-spacing: -0.005em;
@@ -2790,7 +3660,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .skeleton-bar {
     height: 12px; border-radius: 6px;
-    background: linear-gradient(90deg, var(--surface-soft) 0%, #ECE7DD 50%, var(--surface-soft) 100%);
+    background: linear-gradient(90deg, var(--surface-soft) 0%, rgba(34,211,238,0.16) 50%, var(--surface-soft) 100%);
     background-size: 200% 100%;
     animation: shimmer 1.6s linear infinite;
   }
@@ -2830,12 +3700,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     box-shadow: var(--shadow-card);
   }
   .turn-user {
-    background: linear-gradient(135deg, var(--brand-blue) 0%, var(--brand-blue-light) 100%);
-    color: #fff;
+    background: linear-gradient(135deg, var(--cyan) 0%, var(--cyan-bright) 100%);
+    color: #04090E;
     border-bottom-right-radius: 6px;
     align-self: flex-end;
     max-width: 78%;
-    box-shadow: 0 8px 22px -10px rgba(13, 89, 123, 0.45);
+    box-shadow: 0 8px 22px -10px var(--cyan-glow);
   }
   .turn-tool {
     background: var(--surface-soft);
@@ -2857,7 +3727,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     display: inline-flex; align-items: center; gap: 6px;
   }
   .turn-agent .turn-role { color: var(--brand-red); }
-  .turn-user .turn-role { color: rgba(255,255,255,0.85); }
+  .turn-user .turn-role { color: rgba(4,9,14,0.72); }
 
   /* EMPTY STATES */
   .empty-state {
@@ -2896,7 +3766,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .section-active .section-header { color: var(--success); }
   .section-active .section-dot {
     background: var(--success);
-    box-shadow: 0 0 0 0 rgba(4, 120, 87, 0.5);
+    box-shadow: 0 0 8px 1px rgba(52, 245, 197, 0.6);
     animation: livePulse 1.6s ease-in-out infinite;
   }
   .section-ended .section-header { color: var(--ink-muted); }
@@ -2952,7 +3822,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     padding: 14px 18px 14px 16px;
     min-width: 300px; max-width: 380px;
     display: flex; align-items: center; gap: 12px;
-    box-shadow: 0 1px 2px rgba(15,23,42,0.05), 0 18px 40px -12px rgba(15,23,42,0.18);
+    box-shadow: 0 0 0 1px var(--hairline-strong), 0 24px 50px -18px rgba(0,0,0,0.85);
     animation: toastIn 0.42s var(--ease) both;
     pointer-events: auto;
     cursor: pointer;
@@ -3022,8 +3892,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .stats { grid-template-columns: repeat(2, 1fr); }
     .container { grid-template-columns: 1fr; height: auto; min-height: 0; }
     .calls-panel { max-height: 320px; }
-    .page { padding: 16px 14px 0; }
-    header { padding: 12px 16px; }
+    .page { padding: 16px 14px 0; max-width: 100%; }
+    header { padding: 12px 16px; gap: 12px; }
+    .brand { flex-shrink: 0; }
+    /* Header actions never force page overflow — they shrink and scroll horizontally */
+    .header-right {
+      min-width: 0; flex: 1 1 auto; justify-content: flex-end;
+      overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    .header-right::-webkit-scrollbar { display: none; }
+    .header-right > * { flex: 0 0 auto; }
     .detail-content, .detail-header { padding-left: 18px; padding-right: 18px; }
     .stat-value { font-size: 28px; }
   }
@@ -3031,7 +3909,207 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .stats { grid-template-columns: 1fr; }
     .brand-divider, .brand-text { display: none; }
     .clock-pill { display: none; }
+    header { padding: 10px 12px; gap: 10px; }
+    .brand { flex-shrink: 0; }
+    /* Actions become a clean horizontal-scroll strip instead of overflowing the page */
+    .header-right {
+      gap: 8px; min-width: 0; flex: 1; justify-content: flex-end;
+      overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    .header-right::-webkit-scrollbar { display: none; }
+    .header-right > * { flex: 0 0 auto; }
+    .page { padding: 14px 12px 0; }
+    .stat-value { font-size: 26px; }
   }
+
+  /* ===================== MOBILE APP MODE — bottom tabs + detail sheet ===================== */
+  .bottom-tabs { display: none; }
+  .detail-back { display: none; }
+  .m-insights-only { display: none; }
+  .m-tools-label { display: none; }
+
+  @media (max-width: 720px) {
+    /* Slim app bar — logo + live dot only; secondary actions move into tabs/Insights */
+    header { padding: 11px 16px; flex-wrap: wrap; }
+    .brand-divider, .brand-text .subtitle { display: none; }
+    .brand-text h1 { font-size: 15px; }
+    .clock-pill, #alerts-btn, #oncall-btn, #reset-btn, #transfer-btn, #customize-btn, #analytics-link { display: none; }
+    .header-right { gap: 8px; flex: 0 0 auto; }
+    /* Legend drops to its own full-width row under the logo */
+    .legend { display: none; }   /* legend belongs with the call labels — Calls page only */
+    body.m-calls .legend { display: flex; order: 3; flex-basis: 100%; justify-content: space-between;
+      gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hairline); }
+    .legend .lg { font-size: 10.5px; gap: 5px; }
+
+    /* Room for the fixed tab bar */
+    body { padding-bottom: calc(62px + env(safe-area-inset-bottom)); }
+    .page { padding: 14px 14px 0; }
+
+    /* --- Tab panels: body.m-calls / .m-insights / .m-oncall toggles what shows --- */
+    .stats, .howfound-card, .m-insights-only { display: none; }
+    .container { display: block; }                 /* Calls is the default panel */
+    /* On desktop these are overlays; on the phone they ARE the On-Call page, shown
+       inline only when the On-Call tab is active. */
+    #oncall-modal, #transfer-modal { display: none; }
+    body.m-insights .stats { display: grid; }
+    body.m-insights .howfound-card { display: block; }
+    body.m-insights .m-insights-only { display: grid; }
+    body.m-insights .container { display: none; }
+    body.m-calls .stats, body.m-calls .howfound-card, body.m-calls .m-insights-only { display: none; }
+    body.m-calls .container { display: block; }
+    body.m-oncall .container, body.m-oncall .stats, body.m-oncall .howfound-card, body.m-oncall .m-insights-only { display: none; }
+    body.m-oncall #oncall-modal, body.m-oncall #transfer-modal {
+      display: block; position: static; inset: auto; z-index: auto;
+      background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none; padding: 0;
+    }
+    body.m-oncall #oncall-modal .oncall-card, body.m-oncall #transfer-modal .oncall-card {
+      max-width: none; width: auto; margin: 0 14px 14px; max-height: none; animation: none;
+    }
+    body.m-oncall .oncall-close { display: none; }   /* it's a page now, not a popup */
+    /* On-Call page — symmetric, phone-friendly */
+    body.m-oncall .oncall-card { padding: 16px 14px 18px; border-radius: 18px; }
+    body.m-oncall .oncall-head h2 { font-size: 17px; font-weight: 600; }
+    body.m-oncall .oncall-week-nav { flex-wrap: wrap; gap: 8px; justify-content: center; }
+    body.m-oncall .oncall-week-nav button { flex: 1 1 40%; }
+    body.m-oncall .oncall-week-label { flex-basis: 100%; text-align: center; order: -1; }
+    body.m-oncall .oncall-quick select { min-width: 0; }
+    body.m-oncall .oncall-days { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    body.m-oncall .oncall-day { min-height: 132px; }
+    body.m-oncall .oncall-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    body.m-oncall .oncall-actions button { width: 100%; }
+    body.m-oncall .transfer-add { flex-direction: column; align-items: stretch; }
+    body.m-oncall .transfer-add .btn-primary { width: 100%; }
+
+    /* --- Messages: a full-screen native chat app (un-overlay #notif-modal) --- */
+    body.m-messages .container, body.m-messages .stats,
+    body.m-messages .howfound-card, body.m-messages .m-insights-only,
+    body.m-messages #oncall-modal, body.m-messages #transfer-modal { display: none; }
+    body.m-messages #notif-btn { display: none; }   /* the tab replaces the bell on mobile */
+    /* Pull the section flush to the page edges so it reads like a real app screen */
+    body.m-messages .page { padding: 0; }
+    body.m-messages #notif-modal {
+      display: block; position: static; inset: auto; z-index: auto;
+      background: transparent; backdrop-filter: none; -webkit-backdrop-filter: none;
+      padding: 0; overflow: visible;
+    }
+    body.m-messages #notif-modal .oncall-card {
+      max-width: none; width: auto; margin: 0; max-height: none; animation: none;
+      padding: 0; border-radius: 0; border: 0; background: transparent; box-shadow: none;
+      /* Fill the space between the app bar and the bottom tab bar */
+      height: calc(100vh - 56px - 62px - env(safe-area-inset-bottom));
+      display: flex; flex-direction: column;
+    }
+    body.m-messages #chat-listview, body.m-messages #chat-threadview {
+      flex: 1; min-height: 0; display: flex; flex-direction: column;
+    }
+    body.m-messages #chat-threadview[style*="display:none"],
+    body.m-messages #chat-threadview[style*="display: none"] { display: none !important; }
+    body.m-messages .notif-close, body.m-messages #notif-close,
+    body.m-messages #chat-close { display: none; }   /* leave by switching tabs, not a popup X */
+    /* Section header — sticky, native app-bar feel */
+    body.m-messages .oncall-head, body.m-messages .chat-thread-head {
+      margin: 0; padding: 14px 16px; border-bottom: 1px solid var(--hairline);
+      background: rgba(8,12,18,0.92); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+      flex-shrink: 0;
+    }
+    body.m-messages .oncall-head strong { font-size: 18px; }
+    body.m-messages .oncall-head .oncall-sub, body.m-messages .chat-thread-head .oncall-sub {
+      margin-bottom: 0; margin-top: 2px;
+    }
+    body.m-messages .chat-back { width: 36px; height: 36px; font-size: 24px; }
+    /* Inbox list scrolls inside the section, not the page */
+    body.m-messages #chat-list {
+      flex: 1; min-height: 0; max-height: none; overflow-y: auto;
+      -webkit-overflow-scrolling: touch; gap: 2px; padding: 8px 12px 12px;
+    }
+    body.m-messages .chat-row { border-radius: 14px; padding: 12px; }
+    /* Conversation thread fills + scrolls inside the section */
+    body.m-messages #chat-thread {
+      flex: 1; min-height: 0; max-height: none; overflow-y: auto;
+      -webkit-overflow-scrolling: touch; padding: 14px 14px 18px;
+    }
+    /* "Clear all" sits pinned at the bottom of the inbox */
+    body.m-messages #chat-listview .oncall-actions {
+      flex-shrink: 0; padding: 10px 14px calc(10px + env(safe-area-inset-bottom));
+      border-top: 1px solid var(--hairline); justify-content: stretch;
+    }
+    body.m-messages #chat-listview .oncall-actions .oncall-btn { flex: 1; }
+
+    .stats { grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .container { grid-template-columns: 1fr; height: auto; }
+    .calls-panel { max-height: none; }
+
+    /* Detail hidden until a call is tapped, then it slides up as a full-screen sheet */
+    .detail-panel { display: none; }
+    body.detail-open { overflow: hidden; }
+    body.detail-open .detail-panel {
+      display: flex; flex-direction: column;
+      position: fixed; inset: 0; z-index: 80;
+      background: var(--bg); overflow-y: auto;
+      animation: sheetUp 0.28s var(--ease);
+      padding-bottom: calc(24px + env(safe-area-inset-bottom));
+    }
+    @keyframes sheetUp { from { transform: translateY(100%); opacity: 0.6; } to { transform: translateY(0); opacity: 1; } }
+    .detail-back {
+      display: flex; align-items: center; gap: 6px;
+      position: sticky; top: 0; z-index: 2; width: 100%; border: 0; text-align: left;
+      padding: 14px 18px; cursor: pointer;
+      background: rgba(8,12,18,0.88); backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--hairline);
+      color: var(--cyan); font-weight: 600; font-size: 15px; font-family: inherit;
+    }
+    .detail-back svg { width: 18px; height: 18px; }
+
+    /* Insights settings row (proxies the hidden header buttons) */
+    body.m-insights .m-tools-label { display: block; font-size: 11px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-muted); margin: 18px 6px 2px; }
+    .m-insights-only.settings-row { grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 4px; }
+    .settings-item {
+      display: flex; flex-direction: column; align-items: center; gap: 6px;
+      padding: 16px 8px; border-radius: 16px; cursor: pointer;
+      background: var(--surface); border: 1px solid var(--hairline);
+      color: var(--ink-soft); font-size: 12px; font-weight: 600; font-family: inherit;
+    }
+    .settings-item svg { width: 20px; height: 20px; color: var(--cyan); }
+    .settings-item:active { transform: scale(0.97); }
+
+    /* Bottom tab bar */
+    .bottom-tabs {
+      display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 90;
+      background: linear-gradient(180deg, rgba(12,18,27,0.92), rgba(6,9,14,0.98));
+      backdrop-filter: blur(18px) saturate(1.2); -webkit-backdrop-filter: blur(18px) saturate(1.2);
+      border-top: 1px solid var(--hairline);
+      box-shadow: 0 -10px 28px -14px rgba(0,0,0,0.85);
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .tab-btn {
+      flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+      padding: 9px 4px 8px; background: none; border: 0; cursor: pointer;
+      color: var(--ink-muted); font-size: 10.5px; font-weight: 600; font-family: inherit;
+      letter-spacing: 0.02em; transition: color 0.2s var(--ease);
+    }
+    .tab-btn svg { width: 22px; height: 22px; stroke-width: 1.7; transition: filter 0.2s var(--ease); }
+    .tab-btn.active { color: var(--cyan); }
+    .tab-btn.active svg { filter: drop-shadow(0 0 7px var(--cyan-glow)); }
+    /* Bigger touch targets for the most error-prone controls */
+    .oncall-tech-chip { min-height: 44px; padding: 11px 12px; }
+    .oncall-close { font-size: 30px; padding: 6px 14px; min-width: 44px; min-height: 44px; }
+    .tcontact-actions button { min-height: 38px; padding: 8px 12px; }
+    /* Detail-sheet action buttons: full-width, no wrapping */
+    .detail-header .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; width: 100%; }
+    .detail-header .actions .btn { white-space: nowrap; justify-content: center; }
+  }
+  /* Live-call badge on the Calls bottom tab */
+  .tab-btn { position: relative; }
+  .tab-badge {
+    position: absolute; top: 3px; left: 50%; transform: translateX(4px);
+    min-width: 17px; height: 17px; padding: 0 5px; border-radius: 9px;
+    background: var(--success); color: #04090E; font-size: 10px; font-weight: 800;
+    display: none; align-items: center; justify-content: center; line-height: 1;
+    box-shadow: 0 0 8px var(--success);
+  }
+  .tab-badge.show { display: inline-flex; }
+  .tab-badge.msg-badge { background: var(--cyan); color: #04121a; box-shadow: 0 0 8px var(--cyan-glow); }
 </style>
 </head>
 <body>
@@ -3044,6 +4122,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <h1>Call Intelligence</h1>
       <div class="subtitle">Live monitoring · Powered by <a class="brand-link" href="https://manyfai.com" target="_blank" rel="noopener">ManyFai</a></div>
     </div>
+  </div>
+  <div class="legend" id="priority-legend" title="What the call colors mean">
+    <span class="lg"><span class="lg-dot lg-high"></span>High priority</span>
+    <span class="lg"><span class="lg-dot lg-attention"></span>Needs attention</span>
+    <span class="lg"><span class="lg-dot lg-good"></span>Good</span>
+    <span class="lg"><span class="lg-dot lg-check"></span>Worth a look</span>
   </div>
   <div class="header-right">
     <a class="alerts-btn" id="analytics-link" href="#" title="Call quality analytics">
@@ -3062,9 +4146,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
       <span>On-Call</span>
     </button>
+    <button class="alerts-btn" id="transfer-btn" type="button" title="Manage who the AI transfers callers to">
+      <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>
+      <span>Transfer</span>
+    </button>
+    <button class="alerts-btn" id="customize-btn" type="button" title="Customize which boxes show and their order">
+      <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+      <span>Customize</span>
+    </button>
     <button class="alerts-btn" id="reset-btn" type="button" title="Clear all calls from the dashboard">
       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9"/><path d="M3 4v5h5"/></svg>
       <span>Reset</span>
+    </button>
+    <button class="alerts-btn notif-bell" id="notif-btn" type="button" title="Notifications" aria-label="Notifications">
+      <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+      <span class="notif-badge" id="notif-badge"></span>
     </button>
     <div class="status-pill">
       <span class="status-dot" id="status-dot"></span>
@@ -3080,7 +4176,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .oncall-overlay {
     display: none;
     position: fixed; inset: 0;
-    background: rgba(15, 23, 42, 0.45);
+    background: rgba(2, 4, 8, 0.66);
     backdrop-filter: blur(6px);
     z-index: 1000;
     align-items: flex-start;
@@ -3110,7 +4206,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .oncall-quick { display: flex; gap: 8px; align-items: center; padding: 12px 14px; background: var(--brand-blue-soft); border: 1px solid rgba(13, 89, 123, 0.15); border-radius: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   .oncall-quick-label { font-size: 12px; font-weight: 600; color: var(--brand-blue); margin-right: 4px; white-space: nowrap; }
   .oncall-quick select { background: var(--surface); border: 1px solid var(--hairline-strong); color: var(--ink); padding: 6px 10px; border-radius: 6px; font-size: 12px; flex: 1; min-width: 140px; }
-  .oncall-quick button { background: var(--brand-blue); color: white; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; }
+  .oncall-quick button { background: var(--brand-blue); color: #04090E; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600; }
   .oncall-quick button:hover { background: var(--brand-blue-light); }
   .oncall-days { display: grid; grid-template-columns: repeat(7, 1fr); gap: 8px; margin-bottom: 18px; }
   @media (max-width: 720px) { .oncall-days { grid-template-columns: repeat(2, 1fr); } }
@@ -3124,7 +4220,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     gap: 8px;
     transition: border-color 0.15s, box-shadow 0.15s;
   }
-  .oncall-day.has-assignments { border-color: var(--brand-red); background: var(--brand-red-soft); }
+  .oncall-day.has-assignments { border-color: var(--success); background: var(--success-soft); }
   .oncall-day.is-today { border-color: var(--brand-blue); }
   .oncall-day-header { display: flex; flex-direction: column; gap: 2px; }
   .oncall-day-name { font-size: 11px; font-weight: 700; color: var(--ink-muted); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -3137,13 +4233,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     line-height: 1.3;
   }
   .oncall-tech-chip:hover { background: var(--surface-soft); }
-  .oncall-tech-chip.active { background: var(--brand-red); color: white; border-color: var(--brand-red); font-weight: 600; }
+  .oncall-tech-chip.active { background: var(--brand-red); color: #04090E; border-color: var(--brand-red); font-weight: 600; }
   .oncall-actions { display: flex; gap: 8px; justify-content: flex-end; padding-top: 16px; border-top: 1px solid var(--hairline); }
   .oncall-btn { padding: 9px 18px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s; border: 1px solid transparent; font-family: inherit; }
   .oncall-btn-secondary { background: var(--surface); color: var(--ink-soft); border-color: var(--hairline-strong); }
   .oncall-btn-secondary:hover { background: var(--surface-soft); }
-  .oncall-btn-primary { background: var(--brand-red); color: white; }
+  .oncall-btn-primary { background: var(--brand-red); color: #04090E; font-weight: 600; }
   .oncall-btn-primary:hover { background: var(--brand-red-warm); }
+
+  /* Transfer contacts modal */
+  .transfer-targets { display: grid; gap: 8px; margin-bottom: 14px; }
+  .ttarget { display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 11px 14px; border-radius: 12px; background: var(--surface-soft); border: 1px solid var(--hairline); font-size: 13px; }
+  .ttarget span { color: var(--ink-muted); font-weight: 600; }
+  .ttarget b { color: var(--cyan); font-weight: 600; text-align: right; }
+  .transfer-list { display: grid; gap: 8px; max-height: 300px; overflow-y: auto; }
+  .tcontact { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px;
+    background: var(--surface); border: 1px solid var(--hairline); }
+  .tcontact-info { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+  .tcontact-info b { font-size: 14px; color: var(--ink); }
+  .tcontact-info span { font-size: 12px; color: var(--ink-muted); font-family: 'Geist Mono', monospace; }
+  .tcontact-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .tcontact-actions button { padding: 6px 10px; border-radius: 8px; font-size: 12px; font-weight: 600;
+    cursor: pointer; background: var(--surface-soft); border: 1px solid var(--hairline); color: var(--ink-soft); font-family: inherit; }
+  .tcontact-actions button.on { background: var(--cyan); color: #04090E; border-color: transparent; }
+  .tcontact-actions .tdel { color: var(--danger); border-color: rgba(255,80,99,0.3); padding: 6px 9px; }
+  .transfer-add { display: flex; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--hairline); flex-wrap: wrap; }
+  .transfer-add input { flex: 1; min-width: 120px; padding: 10px 12px; border-radius: 10px;
+    background: var(--surface-soft); border: 1px solid var(--hairline); color: var(--ink); font-size: 14px; font-family: inherit; }
+  .transfer-add input::placeholder { color: var(--ink-dim); }
+  .transfer-add .btn-primary { flex: 0 0 auto; }
 </style>
 <div id="oncall-modal" class="oncall-overlay">
   <div class="oncall-card">
@@ -3176,9 +4295,99 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+<div id="transfer-modal" class="oncall-overlay">
+  <div class="oncall-card">
+    <div class="oncall-head">
+      <div>
+        <strong>Transfer contacts</strong>
+        <div class="oncall-sub">Pick who the AI transfers callers to. Tap a contact to set it as the Alfredo or general target.</div>
+      </div>
+      <button id="transfer-close" class="oncall-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div id="transfer-targets" class="transfer-targets"></div>
+    <div id="transfer-list" class="transfer-list"></div>
+    <div class="transfer-add">
+      <input id="tc-name" type="text" placeholder="Name (e.g. Alfredo)" autocomplete="off" />
+      <input id="tc-phone" type="tel" placeholder="+1 954 669 6259" autocomplete="off" />
+      <button id="tc-add" class="btn btn-primary" type="button">Add contact</button>
+    </div>
+  </div>
+</div>
+
 <div class="page">
 
-<div class="stats">
+<style>
+  /* How-found card folded into the widgets grid by JS becomes a full-width row */
+  #dash-widgets > .howfound-card { grid-column: 1 / -1; margin: 0; }
+  /* Widgets being reordered get a subtle lift */
+  #dash-widgets > [data-w].cz-ghost { outline: 1px dashed var(--cyan); outline-offset: 2px; opacity: 0.6; }
+  /* Customize modal */
+  .cz-hint { font-size: 12px; color: var(--ink-muted); margin: 0 2px 14px; }
+  .cz-list { display: flex; flex-direction: column; gap: 8px; }
+  .cz-item { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 12px;
+    background: var(--surface); border: 1px solid var(--hairline); user-select: none; transition: border-color .15s, transform .12s; }
+  .cz-item.dragging { opacity: 0.55; border-color: var(--cyan); box-shadow: 0 0 0 1px var(--cyan), 0 10px 24px -10px var(--cyan-glow); }
+  .cz-item.over { border-color: var(--cyan); transform: translateY(2px); }
+  .cz-handle { cursor: grab; color: var(--ink-dim); display: flex; align-items: center; touch-action: none; padding: 4px; margin: -4px; }
+  .cz-handle:active { cursor: grabbing; color: var(--cyan); }
+  .cz-name { flex: 1; font-size: 14px; font-weight: 600; color: var(--ink); }
+  .cz-item.hidden-w .cz-name { color: var(--ink-dim); text-decoration: line-through; }
+  .cz-eye { background: var(--surface-soft); border: 1px solid var(--hairline); border-radius: 9px;
+    width: 40px; height: 36px; display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+    color: var(--ink-muted); flex-shrink: 0; }
+  .cz-eye.on { color: #04090E; border-color: transparent; background: var(--cyan); }
+</style>
+
+<div id="notif-modal" class="oncall-overlay">
+  <div class="oncall-card">
+    <!-- Chat list (inbox) -->
+    <div id="chat-listview">
+      <div class="oncall-head">
+        <div>
+          <strong>Messages</strong>
+          <div class="oncall-sub">A chat per phone number — all alerts grouped by caller.</div>
+        </div>
+        <button id="notif-close" class="oncall-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div id="chat-list" class="chat-list"></div>
+      <div class="oncall-actions">
+        <button id="notif-clear" class="oncall-btn oncall-btn-secondary" type="button">Clear all</button>
+      </div>
+    </div>
+    <!-- One conversation -->
+    <div id="chat-threadview" style="display:none;">
+      <div class="oncall-head chat-thread-head">
+        <button id="chat-back" class="chat-back" type="button" aria-label="Back">‹</button>
+        <div class="chat-avatar chat-head-avatar" id="chat-peer-avatar"></div>
+        <div style="flex:1; min-width:0;">
+          <strong id="chat-peer-name"></strong>
+          <div class="oncall-sub" id="chat-peer-sub"></div>
+        </div>
+        <button id="chat-close" class="oncall-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div id="chat-thread" class="chat-thread"></div>
+    </div>
+  </div>
+</div>
+
+<div id="customize-modal" class="oncall-overlay">
+  <div class="oncall-card">
+    <div class="oncall-head">
+      <div>
+        <strong>Customize dashboard</strong>
+        <div class="oncall-sub">Drag to reorder, tap the eye to show/hide. Saved on this device.</div>
+      </div>
+      <button id="customize-close" class="oncall-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="cz-hint">Hidden boxes won't appear on your dashboard.</div>
+    <div id="cz-list" class="cz-list"></div>
+    <div class="oncall-actions">
+      <button id="cz-reset" class="oncall-btn oncall-btn-secondary" type="button">Reset to default</button>
+    </div>
+  </div>
+</div>
+
+<div class="stats" id="dash-widgets">
   <div class="stat">
     <span class="stat-label">
       <svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92Z"/></svg>
@@ -3292,6 +4501,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
   <div class="panel detail-panel">
+    <button class="detail-back" type="button" onclick="closeDetail()"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>Back to calls</button>
     <div class="detail-header" id="detail-header" style="display: none;">
       <div class="detail-title">
         <h2 id="detail-from">—</h2>
@@ -3312,7 +4522,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
+  <div class="m-tools-label">Quick actions</div>
+  <div class="m-insights-only settings-row">
+    <button class="settings-item" type="button" onclick="document.getElementById('alerts-btn').click()"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>Alerts</button>
+    <button class="settings-item" type="button" onclick="document.getElementById('analytics-link').click()"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg>Analytics</button>
+    <button class="settings-item" type="button" onclick="openCustomize()"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>Customize</button>
+    <button class="settings-item" type="button" onclick="document.getElementById('reset-btn').click()"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg>Reset</button>
+  </div>
 </div>{# /page #}
+
+<nav class="bottom-tabs" role="tablist">
+  <button class="tab-btn" id="tab-calls" type="button" onclick="setTab('calls')" role="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.91.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92Z"/></svg><span class="tab-badge" id="calls-badge"></span><span>Calls</span></button>
+  <button class="tab-btn" id="tab-messages" type="button" onclick="setTab('messages')" role="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg><span class="tab-badge msg-badge" id="msg-tab-badge"></span><span>Messages</span></button>
+  <button class="tab-btn" id="tab-insights" type="button" onclick="setTab('insights')" role="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 3v18h18"/><path d="M7 14l4-4 3 3 5-6"/></svg><span>Insights</span></button>
+  <button class="tab-btn" id="tab-oncall" type="button" onclick="setTab('oncall')" role="tab"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg><span>On-Call</span></button>
+</nav>
 
 <script>
 const calls = {};
@@ -3376,23 +4600,47 @@ function fmtPhone(p) {
   return p;
 }
 
-function getOutcomeBadge(c) {
+// Priority tier for a call — drives both the status-badge color and the row's
+// left-accent. Matches the header legend: high=red, attention=yellow, good=green,
+// check(worth a look)=blue, live=in progress, neutral=not analyzed yet.
+function callTier(c) {
+  if (c.state === 'active') return 'live';
   const a = c.analysis || {};
   const cad = a.custom_analysis_data || {};
-  const outcome = cad.outcome || '';
+  const outcome = (cad.outcome || '').toUpperCase();
+  const priority = (cad.priority || '').toUpperCase();
   const followup = cad.should_followup === true || cad.should_followup === 'true';
-
+  const incomplete = cad.incomplete_call === true || cad.incomplete_call === 'true';
+  if (!outcome && !priority && !a.call_summary) return 'neutral';
+  if (priority === 'HIGH' || outcome.indexOf('EMERGENCY') >= 0 || outcome === 'MISSED' || outcome === 'FAILED') return 'high';
+  if (followup || incomplete || priority === 'MEDIUM' || outcome.indexOf('CALLBACK') >= 0) return 'attention';
+  if (outcome.indexOf('TRANSFER') >= 0) return 'check';
+  return 'good';
+}
+function outcomeLabel(c, tier) {
+  const cad = (c.analysis && c.analysis.custom_analysis_data) || {};
+  const outcome = (cad.outcome || '').toUpperCase();
+  const followup = cad.should_followup === true || cad.should_followup === 'true';
+  const incomplete = cad.incomplete_call === true || cad.incomplete_call === 'true';
+  if (outcome.indexOf('EMERGENCY') >= 0) return 'Emergency';
+  if (outcome === 'MISSED') return 'Missed';
+  if (outcome === 'FAILED') return 'Failed';
+  if (outcome.indexOf('CALLBACK') >= 0) return 'Callback';
+  if (followup) return tier === 'high' ? 'Urgent follow-up' : 'Needs follow-up';
+  if (incomplete) return 'Incomplete info';
+  if (outcome.indexOf('TRANSFER') >= 0) return 'Transferred';
+  if (outcome === 'SCHEDULED') return 'Scheduled';
+  if (outcome === 'RESOLVED') return 'Resolved';
+  if (outcome.indexOf('INFO') >= 0) return 'Info';
+  return c.state === 'ended' ? 'Ended' : (c.state || 'Unknown');
+}
+function getOutcomeBadge(c) {
   if (c.state === 'active') return '<span class="badge badge-active"><span class="live-pulse"></span>LIVE</span>';
-
-  if (outcome === 'SCHEDULED') return `<span class="badge badge-success">${ICON.check}Scheduled</span>`;
-  if (outcome === 'TRANSFERRED') return `<span class="badge badge-success">${ICON.arrowRight}Transferred</span>`;
-  if (outcome === 'CALLBACK_NEEDED') return '<span class="badge badge-followup">Callback</span>';
-  if (outcome === 'RESOLVED') return `<span class="badge badge-success">${ICON.check}Resolved</span>`;
-  if (outcome === 'MISSED') return '<span class="badge badge-danger">Missed</span>';
-  if (outcome === 'FAILED') return '<span class="badge badge-danger">Failed</span>';
-  if (followup) return '<span class="badge badge-followup">Needs Followup</span>';
-  if (c.state === 'ended') return '<span class="badge badge-ended">Ended</span>';
-  return '<span class="badge badge-ended">' + (c.state || 'Unknown') + '</span>';
+  const tier = callTier(c);
+  const label = outcomeLabel(c, tier);
+  if (tier === 'neutral') return '<span class="badge badge-ended">' + label + '</span>';
+  const cls = { high: 'badge-p-high', attention: 'badge-p-attention', good: 'badge-p-good', check: 'badge-p-check' }[tier];
+  return '<span class="badge ' + cls + '">' + label + '</span>';
 }
 
 function updateStats() {
@@ -3416,6 +4664,10 @@ function updateStats() {
   document.getElementById('stat-total').textContent = todays.length;
   document.getElementById('stat-followup').textContent = followup;
   document.getElementById('stat-success').textContent = successful;
+
+  // Live-call badge on the Calls bottom tab — answers "is a call happening right now?" at a glance
+  const badge = document.getElementById('calls-badge');
+  if (badge) { badge.textContent = active; badge.classList.toggle('show', active > 0); }
 
   renderHowFoundChart();
 }
@@ -3486,7 +4738,7 @@ function renderCallItem(id, i) {
   const c = calls[id];
   const sel = id === selectedCallId ? ' selected' : '';
   const live = c.state === 'active' ? ' live' : '';
-  return `<div class="call-item${sel}${live}" style="--i:${i}" onclick="selectCall('${id}')">
+  return `<div class="call-item${sel}${live} tier-${callTier(c)}" style="--i:${i}" onclick="selectCall('${id}')">
     <div class="call-item-header">
       <div class="call-from">${fmtPhone(c.from_number)}</div>
       <div class="call-time">${fmtTime(c.started_at)}</div>
@@ -3739,12 +4991,212 @@ function selectCall(id) {
   selectedCallId = id;
   renderCallsList();
   renderDetail();
+  if (window.matchMedia('(max-width: 720px)').matches) {
+    document.body.classList.add('detail-open');
+    const dp = document.querySelector('.detail-panel');
+    if (dp) dp.scrollTop = 0;
+  }
 }
+
+// ---- Mobile tab navigation (bottom bar) ----
+function setTab(name) {
+  document.body.classList.remove('detail-open');  // never leave the page scroll-locked when switching tabs
+  document.body.classList.remove('m-calls', 'm-insights', 'm-oncall', 'm-messages');
+  document.body.classList.add('m-' + name);
+  ['calls', 'insights', 'oncall', 'messages'].forEach(t => {
+    const b = document.getElementById('tab-' + t);
+    if (b) b.classList.toggle('active', t === name);
+  });
+  // On-Call is its own page on mobile: load the schedule + transfer contacts inline (no popup)
+  if (name === 'oncall') {
+    if (typeof loadOncallData === 'function') loadOncallData();
+    if (typeof loadTransfer === 'function') loadTransfer();
+  }
+  // Messages is its own full-screen page on mobile: always land on the inbox, fresh
+  if (name === 'messages') {
+    currentChatKey = null;
+    if (typeof showThreadView === 'function') showThreadView(false);
+    if (typeof loadMessages === 'function') loadMessages();
+    else if (typeof renderChatList === 'function') renderChatList();
+  }
+  window.scrollTo(0, 0);
+}
+function closeDetail() { document.body.classList.remove('detail-open'); }
+// Default to the Calls tab on load
+document.body.classList.add('m-calls');
+document.getElementById('tab-calls')?.classList.add('active');
+
+// ---- Transfer contacts ----
+let transferData = { contacts: [], alfredo_id: null, human_id: null, emergency_id: null, env_fallback: {} };
+function _tkey() { return new URLSearchParams(location.search).get('key') || ''; }
+async function openTransfer() {
+  await loadTransfer();
+  document.getElementById('transfer-modal').classList.add('open');
+}
+async function loadTransfer() {
+  try {
+    const r = await fetch('/api/transfer-contacts?key=' + encodeURIComponent(_tkey()));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    transferData = await r.json();
+  } catch (e) {
+    showToast({ kind: 'error', title: 'Could not load transfer contacts', subtitle: 'Check your connection and reopen.' });
+  }
+  renderTransfer();
+}
+function _tLabel(id) {
+  const c = (transferData.contacts || []).find(x => x.id === id);
+  return c ? (escapeHtml(c.name) + ' · ' + escapeHtml(c.phone)) : null;
+}
+function renderTransfer() {
+  const t = transferData, fb = t.env_fallback || {};
+  document.getElementById('transfer-targets').innerHTML =
+    `<div class="ttarget"><span>Talk to Alfredo</span><b>${_tLabel(t.alfredo_id) || 'Default · ' + escapeHtml(fb.alfredo || '')}</b></div>` +
+    `<div class="ttarget"><span>Talk to someone</span><b>${_tLabel(t.human_id) || 'Default · ' + escapeHtml(fb.human || '')}</b></div>` +
+    `<div class="ttarget"><span>Emergency / on-call</span><b>${_tLabel(t.emergency_id) || 'Default · ' + escapeHtml(fb.emergency || '')}</b></div>`;
+  const list = document.getElementById('transfer-list');
+  list.innerHTML = (t.contacts && t.contacts.length) ? t.contacts.map(c => `
+    <div class="tcontact">
+      <div class="tcontact-info"><b>${escapeHtml(c.name)}</b><span>${escapeHtml(c.phone)}</span></div>
+      <div class="tcontact-actions">
+        <button class="${t.alfredo_id === c.id ? 'on' : ''}" onclick="assignTransfer('alfredo','${c.id}')">Alfredo</button>
+        <button class="${t.human_id === c.id ? 'on' : ''}" onclick="assignTransfer('human','${c.id}')">General</button>
+        <button class="${t.emergency_id === c.id ? 'on' : ''}" onclick="assignTransfer('emergency','${c.id}')">Emergency</button>
+        <button class="tdel" title="Delete" onclick="deleteTransfer('${c.id}')">✕</button>
+      </div>
+    </div>`).join('') : '<div class="howfound-empty">No contacts yet — add one below.</div>';
+}
+async function addTransferContact() {
+  const name = document.getElementById('tc-name').value.trim();
+  const phone = document.getElementById('tc-phone').value.trim();
+  if (!name || !phone) { alert('Enter a name and a phone number.'); return; }
+  await fetch('/api/transfer-contacts?key=' + encodeURIComponent(_tkey()), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, phone }) });
+  document.getElementById('tc-name').value = '';
+  document.getElementById('tc-phone').value = '';
+  await loadTransfer();
+}
+async function assignTransfer(role, id) {
+  const cur = transferData[role + '_id'];
+  await fetch('/api/transfer-contacts/assign?key=' + encodeURIComponent(_tkey()), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role, id: cur === id ? null : id }) });
+  await loadTransfer();
+}
+async function deleteTransfer(id) {
+  if (!confirm('Delete this contact?')) return;
+  await fetch('/api/transfer-contacts/' + id + '?key=' + encodeURIComponent(_tkey()), { method: 'DELETE' });
+  await loadTransfer();
+}
+document.getElementById('tc-add')?.addEventListener('click', addTransferContact);
+document.getElementById('transfer-close')?.addEventListener('click', () => document.getElementById('transfer-modal').classList.remove('open'));
+document.getElementById('transfer-modal')?.addEventListener('click', e => { if (e.target.id === 'transfer-modal') document.getElementById('transfer-modal').classList.remove('open'); });
+document.getElementById('transfer-btn')?.addEventListener('click', openTransfer);
+
+// ---- Customizable dashboard layout (show/hide + reorder, saved per-device) ----
+const CZ_KEY = 'htac_dash_layout_v1';
+const CZ_WIDGETS = [
+  { id: 'active',   name: 'Active Calls' },
+  { id: 'total',    name: 'Total Today' },
+  { id: 'followup', name: 'Need Followup' },
+  { id: 'success',  name: 'Successful' },
+  { id: 'howfound', name: 'How Customers Found Us' },
+];
+function _czEl(id) {
+  if (id === 'howfound') return document.querySelector('.howfound-card');
+  const map = { active: 'stat-active', total: 'stat-total', followup: 'stat-followup', success: 'stat-success' };
+  const v = document.getElementById(map[id]);
+  return v ? v.closest('.stat') : null;
+}
+let czLayout = { order: CZ_WIDGETS.map(w => w.id), hidden: [] };
+function czLoad() {
+  try {
+    const s = JSON.parse(localStorage.getItem(CZ_KEY) || 'null');
+    if (s && Array.isArray(s.order)) {
+      const known = CZ_WIDGETS.map(w => w.id);
+      const order = s.order.filter(id => known.includes(id));
+      known.forEach(id => { if (!order.includes(id)) order.push(id); });
+      czLayout = { order, hidden: (s.hidden || []).filter(id => known.includes(id)) };
+    }
+  } catch (e) {}
+}
+function czApply() {
+  const grid = document.getElementById('dash-widgets');
+  const hf = document.querySelector('.howfound-card');
+  if (grid && hf && hf.parentElement !== grid) grid.appendChild(hf);  // fold how-found into the one orderable grid
+  czLayout.order.forEach((id, i) => {
+    const el = _czEl(id);
+    if (!el) return;
+    el.style.order = i;
+    el.style.display = czLayout.hidden.includes(id) ? 'none' : '';
+  });
+}
+function czSave() { try { localStorage.setItem(CZ_KEY, JSON.stringify(czLayout)); } catch (e) {} }
+function openCustomize() { czRenderList(); document.getElementById('customize-modal').classList.add('open'); }
+function czRenderList() {
+  const eyeOpen = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+  const eyeOff = '<svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+  const dots = '<svg class="icon" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.4"/><circle cx="9" cy="12" r="1.4"/><circle cx="9" cy="18" r="1.4"/><circle cx="15" cy="6" r="1.4"/><circle cx="15" cy="12" r="1.4"/><circle cx="15" cy="18" r="1.4"/></svg>';
+  document.getElementById('cz-list').innerHTML = czLayout.order.map(id => {
+    const w = CZ_WIDGETS.find(x => x.id === id); if (!w) return '';
+    const hidden = czLayout.hidden.includes(id);
+    return `<div class="cz-item${hidden ? ' hidden-w' : ''}" draggable="true" data-cz="${id}">
+      <span class="cz-handle" title="Drag to reorder">${dots}</span>
+      <span class="cz-name">${escapeHtml(w.name)}</span>
+      <button class="cz-eye${hidden ? '' : ' on'}" type="button" title="${hidden ? 'Show' : 'Hide'}" onclick="czToggle('${id}')">${hidden ? eyeOff : eyeOpen}</button>
+    </div>`;
+  }).join('');
+  czWireDrag();
+}
+function czToggle(id) {
+  const i = czLayout.hidden.indexOf(id);
+  if (i >= 0) czLayout.hidden.splice(i, 1); else czLayout.hidden.push(id);
+  czSave(); czApply(); czRenderList();
+}
+function czReorder(fromId, toId) {
+  if (!fromId || fromId === toId) return;
+  const o = czLayout.order;
+  o.splice(o.indexOf(fromId), 1);
+  o.splice(o.indexOf(toId), 0, fromId);
+  czSave(); czApply(); czRenderList();
+}
+let czDragId = null;
+function czWireDrag() {
+  document.querySelectorAll('#cz-list .cz-item').forEach(it => {
+    it.addEventListener('dragstart', e => { czDragId = it.dataset.cz; it.classList.add('dragging'); e.dataTransfer.effectAllowed = 'move'; });
+    it.addEventListener('dragend', () => { it.classList.remove('dragging'); document.querySelectorAll('.cz-item.over').forEach(x => x.classList.remove('over')); });
+    it.addEventListener('dragover', e => { e.preventDefault(); it.classList.add('over'); });
+    it.addEventListener('dragleave', () => it.classList.remove('over'));
+    it.addEventListener('drop', e => { e.preventDefault(); it.classList.remove('over'); czReorder(czDragId, it.dataset.cz); });
+    it.querySelector('.cz-handle').addEventListener('pointerdown', e => czPointerDrag(e, it));
+  });
+}
+function czPointerDrag(e, item) {
+  if (e.pointerType === 'mouse') return;  // mouse uses native HTML5 DnD above
+  e.preventDefault();
+  const id = item.dataset.cz; item.classList.add('dragging');
+  const move = ev => {
+    const over = (document.elementFromPoint(ev.clientX, ev.clientY) || {}).closest?.('.cz-item');
+    document.querySelectorAll('.cz-item.over').forEach(x => x.classList.remove('over'));
+    if (over && over.dataset.cz !== id) over.classList.add('over');
+  };
+  const up = ev => {
+    document.removeEventListener('pointermove', move); document.removeEventListener('pointerup', up);
+    const over = (document.elementFromPoint(ev.clientX, ev.clientY) || {}).closest?.('.cz-item');
+    if (over && over.dataset.cz !== id) czReorder(id, over.dataset.cz);
+    else item.classList.remove('dragging');
+  };
+  document.addEventListener('pointermove', move); document.addEventListener('pointerup', up);
+}
+document.getElementById('customize-btn')?.addEventListener('click', openCustomize);
+document.getElementById('customize-close')?.addEventListener('click', () => document.getElementById('customize-modal').classList.remove('open'));
+document.getElementById('customize-modal')?.addEventListener('click', e => { if (e.target.id === 'customize-modal') document.getElementById('customize-modal').classList.remove('open'); });
+document.getElementById('cz-reset')?.addEventListener('click', () => { czLayout = { order: CZ_WIDGETS.map(w => w.id), hidden: [] }; czSave(); czApply(); czRenderList(); });
+czLoad(); czApply();
 
 document.getElementById('btn-end').addEventListener('click', async () => {
   if (!selectedCallId) return;
   if (!confirm('End this AI call now? The customer will be disconnected.')) return;
-  const r = await fetch(`/api/end-call/${selectedCallId}`, { method: 'POST' });
+  const r = await fetch(`/api/end-call/${selectedCallId}?key=` + encodeURIComponent(_tkey()), { method: 'POST' });
   const j = await r.json();
   if (!j.ok) alert('Failed to end call: ' + (j.error || j.status_code));
 });
@@ -3926,9 +5378,12 @@ function fmtDateLong(d) {
 }
 
 async function openOncall() {
-  oncallModal.classList.add('open');
+  oncallModal.classList.add('open');   // desktop overlay; on mobile the page shows it inline
+  await loadOncallData();
+}
+async function loadOncallData() {
   try {
-    const r = await fetch('/api/oncall');
+    const r = await fetch('/api/oncall?key=' + encodeURIComponent(_tkey()));
     const j = await r.json();
     ONCALL.techs = j.techs || [];
     ONCALL.serverDates = j.dates || {};
@@ -4102,19 +5557,334 @@ alertsBtn.addEventListener('click', async () => {
       const r = await Notification.requestPermission();
       refreshAlertsBtn();
       if (r === 'granted') {
-        showToast({ kind: 'info', title: 'Alerts enabled', subtitle: 'You\\'ll get a notification + chime on every new call', duration: 4500 });
+        const pushed = await subscribePush();
+        showToast({ kind: 'info', title: 'Alerts enabled',
+          subtitle: pushed ? 'You\\'ll get a phone banner + chime on every new call' : 'You\\'ll get a chime + in-app alert on every new call',
+          duration: 4500 });
         playChime('start');
       }
     } catch {}
   } else if (Notification.permission === 'granted') {
-    // Test ping
-    showToast({ kind: 'info', title: 'Alerts already on', subtitle: 'Test chime playing', duration: 3500 });
+    const pushed = await subscribePush();   // (re)register the push subscription
+    showToast({ kind: 'info', title: 'Alerts already on', subtitle: pushed ? 'Phone banners active · test chime' : 'Test chime playing', duration: 3500 });
     playChime('start');
   }
 });
 refreshAlertsBtn();
 
-const evt = new EventSource('/stream');
+// ---- Web Push (iPhone home-screen PWA banners) ----
+const VAPID_PUBLIC = '{{ vapid_public_key }}';
+function urlB64ToUint8(b64) {
+  const pad = '='.repeat((4 - b64.length % 4) % 4);
+  const s = (b64 + pad).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(s); const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+let swReg = null;
+async function initServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  try { swReg = await navigator.serviceWorker.register('/sw.js'); }
+  catch (e) { console.warn('SW register failed', e); }
+}
+async function subscribePush() {
+  try {
+    if (!swReg) await initServiceWorker();
+    if (!swReg || !VAPID_PUBLIC || !('PushManager' in window) || Notification.permission !== 'granted') return false;
+    let sub = await swReg.pushManager.getSubscription();
+    if (!sub) sub = await swReg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(VAPID_PUBLIC) });
+    const r = await fetch('/api/push/subscribe?key=' + encodeURIComponent(_tkey()), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subscription: sub }) });
+    return r.ok;
+  } catch (e) { console.warn('push subscribe failed', e); return false; }
+}
+initServiceWorker();
+if (Notification.permission === 'granted') subscribePush();   // keep the subscription fresh
+
+// ---- Message Center (WhatsApp-style: a chat thread per phone number) ----
+// Messages live on the server (/api/messages); we group them by caller number
+// client-side. Same number → same chat; all unknown/blocked → one "Unknown"
+// chat. Read state is per-device, tracked by message id in localStorage.
+const READ_KEY = 'htac_read_v1';
+let notifs = [];
+let readIds = {};
+let currentChatKey = null;     // which chat the thread view is showing, or null = inbox
+let _chatDeepLinked = false;   // so a ?chat= deep-link only auto-opens once
+try { readIds = JSON.parse(localStorage.getItem(READ_KEY) || '{}'); } catch (e) {}
+function saveRead() { try { localStorage.setItem(READ_KEY, JSON.stringify(readIds)); } catch (e) {} }
+
+function chatKeyOf(m) {
+  if (m.peer_key) return m.peer_key;
+  const p = m.peer || '';
+  if (!p) return 'unknown';
+  if (p === 'system') return 'system';
+  const d = ('' + p).replace(/[^0-9]/g, '');
+  return d || 'unknown';
+}
+function chatLabel(key, sample) {
+  if (key === 'unknown') return 'Unknown / blocked';
+  if (key === 'system') return 'System';
+  return fmtPhone((sample && sample.peer) || key);
+}
+function chatAvatar(key) {
+  // Identity-based (stable per contact), NOT the last message's icon.
+  if (key === 'system') return '🔔';
+  if (key === 'unknown') return '👤';
+  return '📞';
+}
+function totalUnread() { return notifs.filter(x => !readIds[x.id]).length; }
+function refreshNotifBadge() {
+  const n = totalUnread();
+  ['notif-badge', 'msg-tab-badge'].forEach(id => {
+    const b = document.getElementById(id); if (!b) return;
+    b.textContent = n > 9 ? '9+' : n; b.classList.toggle('show', n > 0);
+  });
+}
+function fmtAgo(ts) {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return 'just now';
+  if (s < 3600) return Math.floor(s / 60) + 'm ago';
+  if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+  return new Date(ts).toLocaleDateString();
+}
+function fmtClock(ts) {
+  // Per-bubble time only; the date lives in the day separator.
+  try { return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+  catch (e) { return ''; }
+}
+function fmtDay(ts) {
+  try {
+    const d = new Date(ts), now = new Date();
+    if (d.toDateString() === now.toDateString()) return 'Today';
+    const y = new Date(now); y.setDate(now.getDate() - 1);
+    if (d.toDateString() === y.toDateString()) return 'Yesterday';
+    return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+  } catch (e) { return ''; }
+}
+function groupChats() {
+  const map = {};
+  notifs.forEach(m => {
+    const k = chatKeyOf(m);
+    if (!map[k]) map[k] = { key: k, items: [], sample: m };
+    map[k].items.push(m);
+  });
+  const arr = Object.keys(map).map(k => {
+    const g = map[k];
+    g.items.sort((a, b) => a.ts - b.ts);                 // oldest → newest in a chat
+    g.last = g.items[g.items.length - 1];
+    g.unread = g.items.filter(x => !readIds[x.id]).length;
+    g.label = chatLabel(g.key, g.sample);
+    return g;
+  });
+  arr.sort((a, b) => b.last.ts - a.last.ts);             // most recent chat on top
+  return arr;
+}
+function renderChatList() {
+  const list = document.getElementById('chat-list'); if (!list) return;
+  const chats = groupChats();
+  list.innerHTML = chats.length ? chats.map(g => `
+    <div class="chat-row${g.unread ? ' unread' : ''}" onclick="openChat('${g.key}')">
+      <div class="chat-avatar">${escapeHtml(chatAvatar(g.key))}</div>
+      <div class="chat-row-body">
+        <div class="chat-row-top">
+          <span class="chat-row-name">${escapeHtml(g.label)}</span>
+          <span class="chat-row-time">${fmtAgo(g.last.ts)}</span>
+        </div>
+        <div class="chat-row-bottom">
+          <span class="chat-row-preview"><span class="chat-row-ico">${escapeHtml(g.last.ico || '')}</span>${escapeHtml(g.last.body || g.last.title || '')}</span>
+          ${g.unread ? `<span class="chat-row-badge">${g.unread}</span>` : ''}
+        </div>
+      </div>
+    </div>`).join('') : `
+    <div class="chat-empty">
+      <div class="chat-empty-ico"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg></div>
+      <div class="chat-empty-title">No messages yet</div>
+      <div class="chat-empty-sub">Call alerts and updates will show up here, grouped into a chat per phone number.</div>
+    </div>`;
+}
+function telHref(p) { const d = ('' + (p || '')).replace(/[^0-9+]/g, ''); return d ? 'tel:' + d : ''; }
+function smsHref(p) { const d = ('' + (p || '')).replace(/[^0-9+]/g, ''); return d ? 'sms:' + d : ''; }
+function msgField(ico, text) {
+  return `<div class="msg-field"><span class="msg-field-ico">${ico}</span><span>${escapeHtml(text)}</span></div>`;
+}
+function msgActions(m) {
+  const x = m.meta || {};
+  const phone = x.phone || (m.peer && m.peer !== 'system' ? m.peer : '');
+  const b = [];
+  if (phone) {
+    b.push(`<a class="msg-act" href="${telHref(phone)}">📞 Call</a>`);
+    b.push(`<a class="msg-act" href="${smsHref(phone)}">💬 Text</a>`);
+  }
+  if (x.confirm_text) b.push(`<button class="msg-act" type="button" onclick="copyConfirm('${m.id}')">📋 Copy text</button>`);
+  if (x.hcp_url) b.push(`<a class="msg-act" href="${escapeHtml(x.hcp_url)}" target="_blank" rel="noopener">🔧 Housecall Pro</a>`);
+  if (x.call_id) b.push(`<button class="msg-act" type="button" onclick="openCallFromMsg('${x.call_id}')">📊 View call</button>`);
+  return b.length ? `<div class="msg-actions">${b.join('')}</div>` : '';
+}
+function renderBubble(m) {
+  const x = m.meta || {};
+  const time = `<div class="msg-bubble-time">${fmtClock(m.ts)}</div>`;
+  if (!x.kind) {
+    // Legacy / unstructured message
+    return `<div class="msg-bubble">
+      <div class="msg-bubble-head"><span class="msg-bubble-ico">${escapeHtml(m.ico || '💬')}</span><span class="msg-bubble-title">${escapeHtml(m.title || '')}</span></div>
+      ${m.body ? `<div class="msg-bubble-body">${escapeHtml(m.body)}</div>` : ''}${time}</div>`;
+  }
+  const phone = x.phone || (m.peer && m.peer !== 'system' ? m.peer : '');
+  const kick = `<div class="msg-kicker"><span class="msg-kicker-ico">${escapeHtml(m.ico || '💬')}</span>${escapeHtml((m.title || '').toUpperCase())}</div>`;
+  const nameRow = x.name ? `<div class="msg-name">${escapeHtml(x.name)}</div>` : '';
+  const phoneRow = phone ? `<a class="msg-phone" href="${telHref(phone)}">${escapeHtml(fmtPhone(phone))}</a>` : '';
+  let mid = '';
+  if (x.kind === 'ended') {
+    if (x.summary) mid += msgField('📋', x.summary);
+    if (x.lead_source) mid += msgField('📣', 'Heard via ' + x.lead_source);
+    const chips = [];
+    if (x.duration) chips.push(`<span class="msg-chip">⏱ ${escapeHtml(x.duration)}</span>`);
+    if (x.sentiment) chips.push(`<span class="msg-chip">${escapeHtml(x.sentiment)}</span>`);
+    if (chips.length) mid += `<div class="msg-chips">${chips.join('')}</div>`;
+    if (x.followup) mid += `<div class="msg-followup">🔔 Follow up${x.followup_reason ? ': ' + escapeHtml(x.followup_reason) : ''}</div>`;
+    if (x.booking) {
+      const bk = x.booking;
+      mid += `<div class="msg-booking">
+        <div class="msg-booking-row">🗓 <b>${escapeHtml(bk.service_type || 'Appointment')}</b></div>
+        ${[bk.date, bk.time_window].filter(Boolean).length ? `<div class="msg-booking-sub">${escapeHtml([bk.date, bk.time_window].filter(Boolean).join(', '))}</div>` : ''}
+        ${bk.tech ? `<div class="msg-booking-sub">Tech: ${escapeHtml(bk.tech)}</div>` : ''}
+        ${bk.address ? `<div class="msg-booking-sub">${escapeHtml(bk.address)}</div>` : ''}
+      </div>`;
+    }
+    if (x.confirm_text) mid += `<div class="msg-confirm"><div class="msg-confirm-label">Confirmation text to send</div><div class="msg-confirm-text">${escapeHtml(x.confirm_text)}</div></div>`;
+  } else if (x.kind === 'incoming') {
+    if (x.time) mid += msgField('🕐', x.time);
+  } else if (x.kind === 'emergency') {
+    if (x.address) mid += msgField('📍', x.address);
+    if (x.problem) mid += msgField('⚠️', x.problem);
+    if (x.fee) mid += msgField('💵', 'Fee acknowledged: ' + x.fee);
+    if (x.dest_name) mid += msgField('➡️', 'Transferring to ' + x.dest_name + (x.dest_phone ? ' (' + fmtPhone(x.dest_phone) + ')' : ''));
+  }
+  return `<div class="msg-bubble rich">${kick}${nameRow}${phoneRow}${mid}${msgActions(m)}${time}</div>`;
+}
+function copyConfirm(id) {
+  const m = notifs.find(x => x.id === id); const t = m && m.meta && m.meta.confirm_text;
+  if (!t) return;
+  const done = () => { if (typeof showToast === 'function') showToast({ kind: 'success', title: 'Copied', subtitle: 'Confirmation text copied to clipboard', duration: 2500 }); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(done).catch(() => msgFallbackCopy(t, done));
+  else msgFallbackCopy(t, done);
+}
+function msgFallbackCopy(t, done) {
+  try { const ta = document.createElement('textarea'); ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done && done(); } catch (e) {}
+}
+function openCallFromMsg(callId) {
+  if (!callId) return;
+  if (typeof setTab === 'function') setTab('calls');
+  if (typeof selectCall === 'function') selectCall(callId);
+}
+function renderChatThread() {
+  const wrap = document.getElementById('chat-thread'); if (!wrap || !currentChatKey) return;
+  const items = notifs.filter(m => chatKeyOf(m) === currentChatKey).sort((a, b) => a.ts - b.ts);
+  let lastDay = '';
+  const rows = items.map(m => {
+    const day = fmtDay(m.ts);
+    let sep = '';
+    if (day && day !== lastDay) { lastDay = day; sep = `<div class="msg-day"><span>${escapeHtml(day)}</span></div>`; }
+    return sep + renderBubble(m);
+  }).join('');
+  wrap.innerHTML = `<div class="msg-start">Beginning of conversation</div>` + rows;
+  wrap.scrollTop = wrap.scrollHeight;
+}
+function markChatRead(key) {
+  let changed = false;
+  notifs.forEach(m => { if (chatKeyOf(m) === key && m.id && !readIds[m.id]) { readIds[m.id] = 1; changed = true; } });
+  if (changed) { saveRead(); refreshNotifBadge(); }
+}
+function showThreadView(on) {
+  document.getElementById('chat-listview').style.display = on ? 'none' : 'flex';
+  document.getElementById('chat-threadview').style.display = on ? 'flex' : 'none';
+}
+function msgIsMobile() { return window.matchMedia('(max-width: 720px)').matches; }
+function openMsgOverlay() {
+  // On mobile, Messages is a full-screen tab; on desktop it's the bell-triggered overlay.
+  if (msgIsMobile()) { if (typeof setTab === 'function') setTab('messages'); return; }
+  document.getElementById('notif-modal').classList.add('open');
+}
+function closeMsgOverlay() { document.getElementById('notif-modal').classList.remove('open'); }
+function openChat(key) {
+  // Make the Messages section visible FIRST — setTab('messages') resets currentChatKey,
+  // so we must assign the key after switching, or renderChatThread() would bail out.
+  if (msgIsMobile()) {
+    if (!document.body.classList.contains('m-messages') && typeof setTab === 'function') setTab('messages');
+  } else {
+    document.getElementById('notif-modal').classList.add('open');
+  }
+  currentChatKey = key;
+  const g = groupChats().find(x => x.key === key);
+  const cnt = g ? g.items.length : 0;
+  document.getElementById('chat-peer-name').textContent = g ? g.label : chatLabel(key, null);
+  document.getElementById('chat-peer-sub').textContent = cnt + (cnt === 1 ? ' message' : ' messages');
+  const av = document.getElementById('chat-peer-avatar'); if (av) av.textContent = chatAvatar(key);
+  showThreadView(true);
+  renderChatThread();
+  markChatRead(key);
+  renderChatList();
+}
+function backToList() {
+  currentChatKey = null;
+  showThreadView(false);
+  renderChatList();
+}
+function openNotif() {        // bell + Messages tab → always open the inbox
+  currentChatKey = null;
+  showThreadView(false);
+  renderChatList();
+  openMsgOverlay();
+}
+function msgSectionVisible() {
+  // Visible either as the desktop overlay (.open) or the mobile full-screen tab (body.m-messages).
+  return document.getElementById('notif-modal').classList.contains('open')
+      || document.body.classList.contains('m-messages');
+}
+function addMessage(item, toFront) {
+  if (!item || (item.id && notifs.some(x => x.id === item.id))) return;
+  if (toFront) notifs.unshift(item); else notifs.push(item);
+  if (notifs.length > 200) notifs = notifs.slice(0, 200);
+  const open = msgSectionVisible();
+  if (open && currentChatKey && chatKeyOf(item) === currentChatKey) {
+    renderChatThread(); markChatRead(currentChatKey);
+  } else if (open && !currentChatKey) {
+    renderChatList();
+  }
+  refreshNotifBadge();
+}
+async function loadMessages() {
+  try {
+    const r = await fetch('/api/messages?key=' + encodeURIComponent(_tkey()));
+    if (!r.ok) return;
+    const d = await r.json();
+    notifs = d.messages || [];
+    refreshNotifBadge();
+    if (msgSectionVisible()) {
+      if (currentChatKey) renderChatThread(); else renderChatList();
+    }
+    // Deep-link from a tapped push: ?chat=<key> opens that conversation
+    const ck = new URLSearchParams(location.search).get('chat');
+    if (ck && !_chatDeepLinked) { _chatDeepLinked = true; openChat(ck); }
+  } catch (e) {}
+}
+document.getElementById('notif-btn')?.addEventListener('click', openNotif);
+document.getElementById('notif-close')?.addEventListener('click', closeMsgOverlay);
+document.getElementById('chat-close')?.addEventListener('click', closeMsgOverlay);
+document.getElementById('chat-back')?.addEventListener('click', backToList);
+document.getElementById('notif-modal')?.addEventListener('click', e => { if (e.target.id === 'notif-modal') closeMsgOverlay(); });
+document.getElementById('notif-clear')?.addEventListener('click', async () => {
+  try { await fetch('/api/messages/clear?key=' + encodeURIComponent(_tkey()), { method: 'POST' }); } catch (e) {}
+  notifs = []; readIds = {}; saveRead(); refreshNotifBadge(); backToList();
+});
+// A tapped push (when the app is already open) asks us to jump to a chat
+navigator.serviceWorker?.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'open-chat' && e.data.chat) openChat(e.data.chat);
+});
+refreshNotifBadge();
+loadMessages();
+
+const evt = new EventSource('/stream?key=' + encodeURIComponent(_tkey()));
 evt.onmessage = (e) => {
   try {
     const msg = JSON.parse(e.data);
@@ -4124,6 +5894,11 @@ evt.onmessage = (e) => {
       updateStats();
       renderCallsList();
       renderDetail();
+      return;
+    }
+    if (msg.type === 'message') {
+      // Server-pushed alert (same content as Telegram + iPhone push)
+      addMessage(msg.data, true);
       return;
     }
     if (msg.type === 'snapshot') {
@@ -4143,7 +5918,7 @@ evt.onmessage = (e) => {
         });
         playChime('start');
         browserNotify('New call — High Tech AC', `Incoming from ${phone}`, msg.data.call_id);
-        // Bring tab title attention
+        // Message center + iPhone push are handled server-side (the 'message' event)
         document.title = '🔔 New call — High Tech AC';
       }
     } else if (msg.type === 'call_ended') {
@@ -4163,6 +5938,7 @@ evt.onmessage = (e) => {
         document.title = 'High Tech AC — Call Intelligence';
       }
     } else if (msg.type === 'call_analyzed') {
+      // Wrap-up message arrives separately via the server 'message' event
       calls[msg.data.call_id] = { ...calls[msg.data.call_id], ...msg.data };
     } else if (msg.type === 'booking_created') {
       calls[msg.data.call_id] = { ...calls[msg.data.call_id], ...msg.data };
@@ -4187,7 +5963,7 @@ evt.onopen = () => {
   document.getElementById('status-text').textContent = 'Connected';
 };
 
-fetch('/api/active-calls').then(r => r.json()).then(data => {
+fetch('/api/active-calls?key=' + encodeURIComponent(_tkey())).then(r => r.json()).then(data => {
   data.forEach(c => calls[c.call_id] = c);
   updateStats();
   renderCallsList();
@@ -4197,6 +5973,95 @@ fetch('/api/active-calls').then(r => r.json()).then(data => {
 </html>"""
 
 
+@app.route("/sw.js", methods=["GET"])
+def service_worker():
+    """Service worker for Web Push — must be served at root scope, no auth."""
+    js = """
+self.addEventListener('push', function(event) {
+  let d = {};
+  try { d = event.data ? event.data.json() : {}; } catch (e) {}
+  const title = d.title || 'High Tech AC';
+  event.waitUntil(self.registration.showNotification(title, {
+    body: d.body || '', tag: d.tag || 'htac', renotify: true,
+    icon: '/app-icon-192.png', badge: '/app-icon-192.png',
+    data: { url: d.url || '/dashboard' }
+  }));
+});
+self.addEventListener('notificationclick', function(event) {
+  event.notification.close();
+  const url = (event.notification.data && event.notification.data.url) || '/dashboard';
+  let chat = null;
+  try { chat = new URL(url, self.location.origin).searchParams.get('chat'); } catch (e) {}
+  event.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function(list) {
+    for (const c of list) {
+      if (c.url.indexOf('/dashboard') >= 0 && 'focus' in c) {
+        if (chat) c.postMessage({ type: 'open-chat', chat: chat });
+        return c.focus();
+      }
+    }
+    if (clients.openWindow) return clients.openWindow(url);
+  }));
+});
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+"""
+    return Response(js, mimetype="application/javascript",
+                    headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
+
+
+@app.route("/api/push/subscribe", methods=["POST"])
+def push_subscribe():
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    sub = (request.json or {}).get("subscription")
+    if not sub or not sub.get("endpoint"):
+        return jsonify({"ok": False, "error": "missing subscription"}), 400
+    subs = load_push_subs()
+    if not any(s.get("endpoint") == sub["endpoint"] for s in subs):
+        subs.append(sub)
+        save_push_subs(subs)
+    return jsonify({"ok": True, "count": len(subs)})
+
+
+@app.route("/api/push/unsubscribe", methods=["POST"])
+def push_unsubscribe():
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    ep = (request.json or {}).get("endpoint")
+    subs = [s for s in load_push_subs() if s.get("endpoint") != ep]
+    save_push_subs(subs)
+    return jsonify({"ok": True, "count": len(subs)})
+
+
+@app.route("/api/messages", methods=["GET"])
+def api_messages():
+    """The dashboard message center — every alert that also went to Telegram."""
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    return jsonify({"messages": load_messages()})
+
+
+@app.route("/api/messages/clear", methods=["POST"])
+def api_messages_clear():
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    with _MSG_LOCK:
+        save_messages([])
+    return jsonify({"ok": True})
+
+
+@app.route("/api/push/test", methods=["POST"])
+def push_test():
+    if not _require_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    # Exercise the full loop: message center + Telegram + iPhone push.
+    notify_event("🔔", "Test notification",
+                 "If you can see this in the Message Center and on your phone, everything works.",
+                 "🔔 *Test notification*\nMessage Center + Telegram + iPhone push are connected.",
+                 "Markdown", "", "test", peer="system")
+    return jsonify({"ok": True, "subscriptions": len(load_push_subs())})
+
+
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     """Live call monitoring dashboard. Password-protected via ?key= query param."""
@@ -4204,9 +6069,57 @@ def dashboard():
     if key != DASHBOARD_PASSWORD:
         return Response("Unauthorized — append ?key=YOUR_PASSWORD to the URL", status=401)
     return Response(
-        render_template_string(DASHBOARD_HTML, logo_data_uri=LOGO_DATA_URI),
+        render_template_string(DASHBOARD_HTML, logo_data_uri=LOGO_DATA_URI, dashboard_key=key,
+                               vapid_public_key=VAPID_PUBLIC_KEY),
         mimetype="text/html",
     )
+
+
+def _asset_path(name):
+    """Locate a bundled asset whether server.py runs at repo root or inside deploy/."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (here, os.path.join(here, "assets"),
+              os.path.join(here, "deploy", "assets"), os.path.join(here, "deploy")):
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+@app.route("/app-icon-<int:size>.png")
+def app_icon(size):
+    """Home-screen / PWA icon (public — not secret)."""
+    name = f"app-icon-{size}.png" if size in (192, 512) else "app-icon-512.png"
+    p = _asset_path(name)
+    if not p:
+        return Response(status=404)
+    with open(p, "rb") as f:
+        data = f.read()
+    return Response(data, mimetype="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    """PWA manifest. Gated by the dashboard key so the authenticated start_url
+    (which carries the key) is never exposed publicly."""
+    if request.args.get("key", "") != DASHBOARD_PASSWORD:
+        return Response(status=401)
+    return jsonify({
+        "name": "High Tech AC — Call Intelligence",
+        "short_name": "High Tech AC",
+        "description": "Live call monitoring for High Tech Air Conditioning.",
+        "start_url": f"/dashboard?key={DASHBOARD_PASSWORD}",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "portrait",
+        "background_color": "#ffffff",
+        "theme_color": "#C4080C",
+        "icons": [
+            {"src": "/app-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/app-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    })
 
 
 # ============================================================
@@ -4435,59 +6348,74 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --brand-red: #C4080C;
-    --brand-red-warm: #DF3131;
-    --brand-red-soft: rgba(196, 8, 12, 0.08);
-    --brand-blue: #0D597B;
-    --brand-blue-light: #1386B9;
-    --brand-blue-soft: rgba(13, 89, 123, 0.08);
-    --brand-cream: #F5EEE4;
-    --bg: #FAFAF6;
-    --surface: #FFFFFF;
-    --surface-soft: #F4F1EA;
-    --hairline: rgba(15, 23, 42, 0.07);
-    --hairline-strong: rgba(15, 23, 42, 0.12);
-    --ink: #15171C;
-    --ink-soft: #3B3A3A;
-    --ink-muted: #6B7280;
-    --ink-dim: #9CA3AF;
-    --warning: #B7791F;
-    --warning-soft: rgba(183, 121, 31, 0.12);
-    --success: #047857;
-    --success-soft: rgba(4, 120, 87, 0.10);
-    --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 12px 32px -16px rgba(15, 23, 42, 0.10);
-    --shadow-card-hover: 0 1px 2px rgba(15, 23, 42, 0.05), 0 24px 48px -20px rgba(15, 23, 42, 0.16);
+    /* Futuristic dark theme — matches the live dashboard */
+    --cyan: #22D3EE;
+    --cyan-bright: #67E8F9;
+    --cyan-soft: rgba(34, 211, 238, 0.12);
+    --brand-red: var(--cyan);
+    --brand-red-warm: var(--cyan-bright);
+    --brand-red-soft: var(--cyan-soft);
+    --brand-blue: var(--cyan);
+    --brand-blue-light: var(--cyan-bright);
+    --brand-blue-soft: var(--cyan-soft);
+    --brand-cream: #0E1620;
+    --bg: #05070B;
+    --surface: #0C121B;
+    --surface-soft: #121C28;
+    --hairline: rgba(34, 211, 238, 0.12);
+    --hairline-strong: rgba(34, 211, 238, 0.26);
+    --ink: #E8F4F8;
+    --ink-soft: #B6C8D2;
+    --ink-muted: #7C93A0;
+    --ink-dim: #51697A;
+    --warning: #FBBF24;
+    --warning-soft: rgba(251, 191, 36, 0.14);
+    --success: #34F5C5;
+    --success-soft: rgba(52, 245, 197, 0.13);
+    --danger: #FF5063;
+    --danger-soft: rgba(255, 80, 99, 0.15);
+    --shadow-card: 0 1px 0 rgba(255,255,255,0.03) inset, 0 20px 44px -28px rgba(0,0,0,0.9);
+    --shadow-card-hover: 0 0 0 1px var(--hairline-strong), 0 24px 60px -26px rgba(34,211,238,0.22);
     --ease: cubic-bezier(0.16, 1, 0.3, 1);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
+  html { overflow-x: hidden; }
   body {
     font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif;
     background: var(--bg);
     background-image:
-      radial-gradient(1200px 600px at -10% -20%, rgba(196, 8, 12, 0.045), transparent 60%),
-      radial-gradient(1100px 700px at 110% 10%, rgba(13, 89, 123, 0.05), transparent 55%);
+      radial-gradient(900px 520px at 8% -10%, rgba(34, 211, 238, 0.10), transparent 60%),
+      radial-gradient(1000px 640px at 108% 4%, rgba(34, 211, 238, 0.06), transparent 55%),
+      linear-gradient(rgba(34,211,238,0.022) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(34,211,238,0.022) 1px, transparent 1px);
+    background-size: auto, auto, 44px 44px, 44px 44px;
+    background-attachment: fixed;
     color: var(--ink);
-    font-size: 14px; line-height: 1.55;
+    font-size: 14px; line-height: 1.55; overflow-x: hidden;
     -webkit-font-smoothing: antialiased;
   }
-  ::selection { background: var(--brand-red-soft); color: var(--brand-red); }
+  ::selection { background: var(--cyan-soft); color: var(--cyan-bright); }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(34,211,238,0.22); border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
   svg:not([class*="icon"]):not([width]) { width: 16px; height: 16px; flex-shrink: 0; }
   .icon { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 1.6; }
   .icon-sm { width: 14px; height: 14px; flex-shrink: 0; }
   .icon-xs { width: 12px; height: 12px; flex-shrink: 0; }
 
   header {
-    background: rgba(255, 255, 255, 0.85);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
+    background: linear-gradient(180deg, rgba(12,18,27,0.92), rgba(8,12,18,0.72));
+    backdrop-filter: blur(16px) saturate(1.2);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
     border-bottom: 1px solid var(--hairline);
+    box-shadow: 0 1px 0 rgba(34,211,238,0.10), 0 16px 40px -28px rgba(0,0,0,0.9);
     padding: 16px 32px;
     display: flex; align-items: center; justify-content: space-between;
     position: sticky; top: 0; z-index: 20;
   }
   .brand { display: flex; align-items: center; gap: 16px; }
-  .brand-mark { height: 40px; width: auto; }
+  .brand-mark { height: 44px; width: auto; filter: drop-shadow(0 2px 10px rgba(34, 211, 238, 0.30)); }
   .brand-divider { width: 1px; height: 28px; background: var(--hairline-strong); }
   .brand-text h1 { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
   .brand-text .subtitle { font-size: 11.5px; color: var(--ink-muted); margin-top: 3px; font-weight: 500; }
@@ -4509,7 +6437,7 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
   }
   .btn-link:hover { background: var(--surface-soft); border-color: var(--hairline-strong); }
   .btn-link.active {
-    background: var(--brand-red-soft); color: var(--brand-red); border-color: rgba(196,8,12,0.18);
+    background: var(--cyan-soft); color: var(--cyan-bright); border-color: rgba(34,211,238,0.30);
   }
   .range-group { display: inline-flex; gap: 4px; padding: 3px;
     background: var(--surface-soft); border: 1px solid var(--hairline); border-radius: 100px; }
@@ -4518,7 +6446,7 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
     font: 600 12px 'Geist', sans-serif; color: var(--ink-muted); cursor: pointer;
   }
   .range-group button.active { background: var(--surface); color: var(--ink);
-    box-shadow: 0 1px 0 rgba(15,23,42,0.06), 0 4px 12px -6px rgba(15,23,42,0.12); }
+    box-shadow: 0 1px 0 rgba(255,255,255,0.03) inset, 0 6px 16px -8px rgba(0,0,0,0.8); }
 
   .page { max-width: 1480px; margin: 0 auto; padding: 24px 32px 60px; }
   .page-title {
@@ -4641,7 +6569,7 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
   }
   .score-pill.good { background: var(--success-soft); color: var(--success); border-color: rgba(4,120,87,0.18); }
   .score-pill.mid  { background: var(--warning-soft); color: var(--warning); border-color: rgba(183,121,31,0.22); }
-  .score-pill.bad  { background: var(--brand-red-soft); color: var(--brand-red); border-color: rgba(196,8,12,0.18); }
+  .score-pill.bad  { background: var(--danger-soft); color: var(--danger); border-color: rgba(255,80,99,0.3); }
   .review-body strong {
     font-size: 13.5px; font-weight: 600; display: block;
     color: var(--ink); letter-spacing: -0.005em;
@@ -4659,9 +6587,9 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
   }
   .b-success { background: var(--success-soft); color: var(--success); border-color: rgba(4,120,87,0.22); }
   .b-warning { background: var(--warning-soft); color: var(--warning); border-color: rgba(183,121,31,0.22); }
-  .b-danger  { background: var(--brand-red-soft); color: var(--brand-red); border-color: rgba(196,8,12,0.18); }
+  .b-danger  { background: var(--danger-soft); color: var(--danger); border-color: rgba(255,80,99,0.3); }
   .b-neutral { background: var(--surface-soft); color: var(--ink-muted); border-color: var(--hairline); }
-  .b-sev-high { background: var(--brand-red-soft); color: var(--brand-red); border-color: rgba(196,8,12,0.18); }
+  .b-sev-high { background: var(--danger-soft); color: var(--danger); border-color: rgba(255,80,99,0.3); }
   .b-sev-med  { background: var(--warning-soft); color: var(--warning); border-color: rgba(183,121,31,0.22); }
   .b-sev-low  { background: var(--success-soft); color: var(--success); border-color: rgba(4,120,87,0.22); }
 
@@ -4719,8 +6647,8 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
   .btn:active:not(:disabled) { transform: translateY(1px); }
   .btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .btn-primary {
-    background: var(--brand-red); color: #fff;
-    box-shadow: 0 1px 0 rgba(255,255,255,0.18) inset, 0 6px 14px -8px rgba(196,8,12,0.5);
+    background: linear-gradient(180deg, var(--cyan-bright), var(--cyan)); color: #04090E;
+    box-shadow: 0 0 0 1px rgba(34,211,238,0.5) inset, 0 8px 20px -8px rgba(34,211,238,0.55);
   }
   .btn-primary:hover:not(:disabled) { background: var(--brand-red-warm); }
   .btn-ghost { background: var(--surface-soft); color: var(--ink); border-color: var(--hairline); }
@@ -4736,7 +6664,7 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
 
   /* Modal — diff viewer */
   .modal-bg {
-    position: fixed; inset: 0; background: rgba(15, 23, 42, 0.45);
+    position: fixed; inset: 0; background: rgba(2, 4, 8, 0.66);
     backdrop-filter: blur(6px);
     display: none; z-index: 50;
     animation: fadeIn 0.2s var(--ease);
@@ -4747,7 +6675,7 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
     background: var(--surface); border-radius: 22px;
     width: 100%; max-width: 1080px; max-height: 90vh;
     display: flex; flex-direction: column; overflow: hidden;
-    box-shadow: 0 30px 80px -20px rgba(15,23,42,0.4);
+    box-shadow: 0 30px 80px -20px rgba(0,0,0,0.85);
     animation: modalIn 0.32s var(--ease);
   }
   @keyframes modalIn { from { opacity: 0; transform: translateY(12px) scale(0.985); } to { opacity: 1; transform: translateY(0) scale(1); } }
@@ -4791,14 +6719,14 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
     max-height: 50vh;
   }
   .diff-pre .add { background: rgba(4, 120, 87, 0.10); color: var(--success); display: block; }
-  .diff-pre .del { background: rgba(196, 8, 12, 0.10); color: var(--brand-red); display: block; }
+  .diff-pre .del { background: rgba(255, 80, 99, 0.12); color: var(--danger); display: block; }
   .diff-pre .hunk { color: var(--brand-blue); display: block; font-weight: 600; }
   .toast {
     position: fixed; bottom: 24px; right: 24px;
     background: var(--surface); border: 1px solid var(--hairline);
     border-left: 3px solid var(--success);
     border-radius: 14px; padding: 14px 18px;
-    box-shadow: 0 18px 40px -12px rgba(15,23,42,0.18);
+    box-shadow: 0 18px 44px -14px rgba(0,0,0,0.8);
     font-size: 13px; max-width: 360px;
     animation: modalIn 0.32s var(--ease);
     z-index: 60;
@@ -4810,6 +6738,19 @@ ANALYTICS_HTML = r"""<!DOCTYPE html>
     .grid { grid-template-columns: 1fr; }
     .page { padding: 18px 16px 40px; }
     header { padding: 12px 16px; }
+  }
+  @media (max-width: 720px) {
+    header { padding: 11px 14px; gap: 10px; }
+    .brand-divider, .brand-text .subtitle { display: none; }
+    .header-right {
+      min-width: 0; flex: 1 1 auto; justify-content: flex-end; gap: 8px;
+      overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+    }
+    .header-right::-webkit-scrollbar { display: none; }
+    .header-right > * { flex: 0 0 auto; }
+    .kpis { grid-template-columns: 1fr; }
+    .page { padding: 14px 14px 48px; }
+    .page-title { font-size: 22px; }
   }
 </style>
 </head>
@@ -5360,7 +7301,7 @@ def analytics_page():
 
 
 # ============================================================
-# PRIVACY POLICY (public, for Twilio A2P + general compliance)
+# PRIVACY POLICY (public, for general compliance)
 # ============================================================
 
 PRIVACY_POLICY_HTML = """<!doctype html>
@@ -5412,7 +7353,6 @@ li{margin-bottom:6px}
 <ul>
   <li><strong>Housecall Pro</strong> — our scheduling and dispatch platform. Receives your name, contact info, address, and appointment details to assign a technician.</li>
   <li><strong>Retell AI</strong> — provides the voice AI infrastructure that answers and transcribes calls.</li>
-  <li><strong>Twilio</strong> — sends SMS notifications. Receives the destination number and message content only.</li>
 </ul>
 <p>We do not sell your personal information to anyone, ever.</p>
 
