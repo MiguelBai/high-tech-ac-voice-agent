@@ -8,6 +8,7 @@ Deploy on Railway ($5/mo) — stays awake 24/7 for live voice calls.
 import os
 import json
 import queue
+import time
 import base64
 import uuid
 import sqlite3
@@ -1363,6 +1364,61 @@ def get_busy_hours_by_tech(start_date, end_date):
 
 
 # ============================================================
+# AVAILABILITY CACHE — avoids slow HCP queries on every call
+# ============================================================
+# HCP /jobs pagination can take 30-45 s per check. We pre-warm on startup,
+# refresh every 4 min in background, and serve check_availability from cache
+# (< 1 s). The create_appointment double-check still hits HCP live.
+_AVAIL_CACHE: dict = {
+    "busy_by_tech": {},
+    "all_busy": set(),
+    "fetched_at": 0.0,
+    "cache_date": None,
+}
+_AVAIL_CACHE_TTL = 300  # seconds (5 min)
+
+
+def _refresh_avail_cache() -> None:
+    now = datetime.now(LOCAL_TZ)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=DAYS_AHEAD_TO_CHECK + 1)
+    try:
+        busy_by_tech, all_busy = get_busy_hours_by_tech(start, end)
+        _AVAIL_CACHE["busy_by_tech"] = busy_by_tech
+        _AVAIL_CACHE["all_busy"] = all_busy
+        _AVAIL_CACHE["fetched_at"] = time.time()
+        _AVAIL_CACHE["cache_date"] = now.date()
+        logger.info("[avail-cache] refreshed OK")
+    except Exception as exc:
+        logger.warning(f"[avail-cache] refresh failed: {exc}")
+
+
+def _avail_cache_loop() -> None:
+    while True:
+        gevent.sleep(250)
+        _refresh_avail_cache()
+
+
+def get_busy_hours_cached(start_date, end_date):
+    """Return busy hours from cache when fresh; fall back to live HCP otherwise."""
+    now_ts = time.time()
+    today = datetime.now(LOCAL_TZ).date()
+    if (
+        _AVAIL_CACHE["fetched_at"] > 0
+        and now_ts - _AVAIL_CACHE["fetched_at"] < _AVAIL_CACHE_TTL
+        and _AVAIL_CACHE["cache_date"] == today
+    ):
+        return _AVAIL_CACHE["busy_by_tech"], _AVAIL_CACHE["all_busy"]
+    # Cache miss — fetch live and populate for next caller
+    busy_by_tech, all_busy = get_busy_hours_by_tech(start_date, end_date)
+    _AVAIL_CACHE["busy_by_tech"] = busy_by_tech
+    _AVAIL_CACHE["all_busy"] = all_busy
+    _AVAIL_CACHE["fetched_at"] = now_ts
+    _AVAIL_CACHE["cache_date"] = today
+    return busy_by_tech, all_busy
+
+
+# ============================================================
 # ON-CALL SCHEDULE — persisted to JSON file on Railway disk
 # ============================================================
 # Persist to the Railway volume (DATA_DIR=/data), NOT /tmp — /tmp is wiped on every
@@ -1678,7 +1734,7 @@ def check_availability():
             end_date = start_date + timedelta(days=DAYS_AHEAD_TO_CHECK)
 
         # Get per-tech busy hours
-        busy_by_tech, _ = get_busy_hours_by_tech(start_date, end_date)
+        busy_by_tech, _ = get_busy_hours_cached(start_date, end_date)
 
         # Generate available slots — a slot is open if at least 1 tech is free
         # Higher cap when only one date so we return ALL slots for that day
@@ -1728,9 +1784,26 @@ def check_availability():
                 "result": "It looks like our schedule is quite full in the next few days. Let me have our scheduling team call you back to find the best time. Can I confirm your phone number?"
             })
 
-        # Keep it short — the agent offers ONE window at a time. When the caller
-        # named a time we return that time (+1 fallback day); otherwise a few.
-        slots_to_return = available_slots[:2] if target_hour is not None else available_slots[:3]
+        # Filter to business-hours daytime only (8 AM start, end by 5 PM / 17:00)
+        # so the agent never proactively surfaces 6 AM or after-5 PM slots.
+        daytime_slots = [
+            s for s in available_slots
+            if int(s["start_time"].split(":")[0]) >= 8
+            and int(s["end_time"].split(":")[0]) <= 17
+        ]
+        if not daytime_slots:
+            daytime_slots = available_slots  # fallback: nothing in range, use all
+
+        # Return ALL slots for the requested day so the agent can read them all.
+        # When no specific date was given, return the first 5 daytime slots.
+        if preferred_date and target_hour is None:
+            same_day = [s for s in daytime_slots if s["date"] == preferred_date]
+            slots_to_return = same_day if same_day else daytime_slots[:5]
+        elif target_hour is not None:
+            slots_to_return = available_slots[:2]
+        else:
+            slots_to_return = daytime_slots[:5]
+
         slot_text = "\n".join([f"- {s['display']}" for s in slots_to_return])
         return jsonify({
             "result": json.dumps({
@@ -1872,7 +1945,7 @@ def create_appointment():
             req_hour = int(start_time.split(":")[0])
             end_date_check = req_date + timedelta(days=DAYS_AHEAD_TO_CHECK)
 
-            busy_by_tech, _ = get_busy_hours_by_tech(req_date, end_date_check)
+            busy_by_tech, _ = get_busy_hours_cached(req_date, end_date_check)
             assigned_tech = find_available_tech(busy_by_tech, req_date.date(), req_hour, SLOT_DURATION_HOURS)
 
             if not assigned_tech:
@@ -2355,6 +2428,8 @@ POLL_GREENLETS = {}  # call_id -> gevent greenlet
 hydrate_active_calls()
 gevent.spawn(reviewer_loop)
 gevent.spawn(synthesis_loop)
+gevent.spawn(_refresh_avail_cache)   # pre-warm availability cache at startup
+gevent.spawn(_avail_cache_loop)      # keep it fresh every 4 min
 
 def broadcast_event(event_type, data):
     """Push an event to all connected dashboard clients."""
