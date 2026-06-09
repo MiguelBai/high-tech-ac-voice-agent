@@ -1893,6 +1893,13 @@ def create_appointment():
         }
         zip_code = city_zip_map.get((city or "").lower().strip(), "")
 
+    # ── Normalize phone — strip non-digits, remove leading US country code if 11 digits ──
+    if phone:
+        phone_digits = _re.sub(r'\D', '', str(phone))
+        if len(phone_digits) == 11 and phone_digits.startswith('1'):
+            phone_digits = phone_digits[1:]
+        phone = phone_digits  # use normalized form; if not 10 digits HCP may still accept
+
     # ── Validation ── (name + phone + email all required)
     if not first_name or not last_name:
         return jsonify({
