@@ -2145,7 +2145,12 @@ def create_appointment():
             if email:
                 customer_data["email"] = email
 
-            cust_resp = hcp_post("/customers", customer_data)
+            try:
+                cust_resp = hcp_post("/customers", customer_data)
+            except requests.HTTPError:
+                # HCP rejected the phone — retry without it so the booking still goes through
+                customer_data.pop("mobile_number", None)
+                cust_resp = hcp_post("/customers", customer_data)
             customer_id = cust_resp.get("id", "")
 
             address_id = ""
